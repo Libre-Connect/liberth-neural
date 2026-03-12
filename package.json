@@ -1,0 +1,56 @@
+{
+  "name": "liberth-neural",
+  "version": "0.1.0",
+  "description": "Open-source neural character studio for building role-driven conversational agents.",
+  "private": false,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "author": "LibreConnect",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Libre-Connect/liberth-neural.git"
+  },
+  "homepage": "https://github.com/Libre-Connect/liberth-neural",
+  "bugs": {
+    "url": "https://github.com/Libre-Connect/liberth-neural/issues"
+  },
+  "keywords": [
+    "ai",
+    "character",
+    "chatbot",
+    "llm",
+    "neural-persona",
+    "react",
+    "express"
+  ],
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "dev": "npx concurrently -k -n server,client \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:client": "vite",
+    "dev:server": "tsx server/index.ts",
+    "build:client": "vite build",
+    "build:server": "esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/server/index.js",
+    "build": "npm run build:client && npm run build:server",
+    "start": "node dist/server/index.js",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "check": "npm run typecheck"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "20.16.11",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.2",
+    "concurrently": "^9.2.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.1",
+    "typescript": "5.6.3",
+    "vite": "^5.4.19"
+  }
+}
