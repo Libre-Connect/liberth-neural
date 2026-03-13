@@ -345,6 +345,12 @@ export type GenerationTrace = {
   providerMode: ProviderMode;
   model: string;
   reason?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  compacted?: boolean;
+  compactionCount?: number;
+  nativeTools?: boolean;
 };
 
 export type NeuralRecord = {
@@ -389,6 +395,14 @@ export type CharacterRecord = {
   skillIds: string[];
 };
 
+export type ToolEventRecord = {
+  step: number;
+  tool: string;
+  arguments: Record<string, unknown>;
+  ok: boolean;
+  summary: string;
+};
+
 export type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -396,6 +410,15 @@ export type ChatMessage = {
   createdAt: number;
   generation?: GenerationTrace | null;
   neuralRecord?: NeuralRecord | null;
+  toolEvents?: ToolEventRecord[];
+};
+
+export type ConversationCompaction = {
+  summary: string;
+  updatedAt: number;
+  sourceMessageCount: number;
+  count: number;
+  instructions?: string;
 };
 
 export type ConversationRecord = {
@@ -405,6 +428,7 @@ export type ConversationRecord = {
   createdAt: number;
   updatedAt: number;
   messages: ChatMessage[];
+  compaction?: ConversationCompaction | null;
 };
 
 export type DeploymentChannel = "telegram" | "slack" | "webhook";

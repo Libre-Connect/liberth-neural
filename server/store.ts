@@ -100,6 +100,25 @@ export async function readStore(): Promise<StoreShape> {
         }))
       : [];
 
+    const conversations = Array.isArray(parsed.conversations)
+      ? parsed.conversations.map((item) => ({
+          ...item,
+          messages: Array.isArray(item.messages) ? item.messages : [],
+          compaction: item.compaction && typeof item.compaction === "object"
+            ? {
+                summary: String(item.compaction.summary || "").trim(),
+                updatedAt: Number(item.compaction.updatedAt || item.updatedAt || Date.now()),
+                sourceMessageCount: Math.max(
+                  0,
+                  Number(item.compaction.sourceMessageCount || 0),
+                ),
+                count: Math.max(0, Number(item.compaction.count || 0)),
+                instructions: String(item.compaction.instructions || "").trim() || undefined,
+              }
+            : null,
+        }))
+      : [];
+
     const installedSkills = Array.isArray(parsed.installedSkills)
       ? parsed.installedSkills.map((item) => ({
           skillId: String(item.skillId || "").trim(),
@@ -135,6 +154,7 @@ export async function readStore(): Promise<StoreShape> {
       ...defaultStore,
       ...parsed,
       characters,
+      conversations,
       installedSkills,
       automations,
       automationRuns,

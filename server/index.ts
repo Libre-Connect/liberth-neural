@@ -8,6 +8,7 @@ import type {
   DeploymentChannel,
   DeploymentPlatformKey,
   DeploymentRecord,
+  GenerationTrace,
   NeuralMemoryRecord,
   NeuralRecord,
   ProviderSettings,
@@ -29,13 +30,31 @@ import {
   upsertConversation,
   upsertDeployment,
 } from "./store";
-import type { LlmRuntimeConfig } from "./llm";
 import {
-  buildCharacterRuntimeSystemPrompt,
-  composeCharacterFromBrief,
-  generateBlueprint,
-  generateRoleReplyDetailed,
-} from "./roles";
+  createOrUpdateAutomation,
+  deleteAutomation,
+  initializeAutomationScheduler,
+  runAutomationNow,
+} from "./automation";
+import { runRoleAgentTurn } from "./agent-runtime";
+import {
+  buildConversationHistory,
+  compactConversationIfNeeded,
+} from "./conversation-compaction";
+import type { LlmRuntimeConfig } from "./llm";
+import { composeCharacterFromBrief, generateBlueprint } from "./roles";
+import {
+  attachSkillToCharacter,
+  detachSkillFromCharacter,
+  formatSkillListReply,
+  listSkillCatalog,
+  loadActiveSkill,
+  loadAttachedSkills,
+  parseChatCommand,
+  removeWorkspaceSkill,
+  resolveCharacterSkills,
+} from "./skills";
+import { buildRuntimeSystemPrompt } from "./workspace";
 import { clientDistPath } from "./project-paths";
 
 const app = express();
@@ -82,6 +101,16 @@ function ensureCharacterBriefInput(input: any) {
   };
 }
 
+function ensureAutomationInput(input: any) {
+  const rawInterval = Number.parseInt(String(input?.intervalMinutes ?? 60), 10);
+  return {
+    name: String(input?.name || "").trim(),
+    prompt: String(input?.prompt || "").trim(),
+    intervalMinutes: Number.isFinite(rawInterval) && rawInterval > 0 ? rawInterval : 60,
+    enabled: input?.enabled !== false,
+  };
+}
+
 async function resolveProviderSettings() {
   const store = await readStore();
   return normalizeProviderSettings({
@@ -113,6 +142,42 @@ function publicProviderSettings(provider: ProviderSettings): ProviderSettings {
     ...provider,
     apiKey: "",
   };
+}
+
+function buildNeuralRuntimeSection(input: {
+  neuralState: CharacterRecord["lastNeuralState"];
+  globalMemories: NeuralMemoryRecord[];
+}) {
+  const neuralState = input.neuralState;
+  if (!neuralState) return "";
+
+  const memoryLines = input.globalMemories
+    .slice(-6)
+    .map((memory) => `- ${memory.content}`)
+    .join("\n");
+
+  const supportingNeurons = neuralState.routeInspector.supportingNeurons
+    .slice(0, 6)
+    .map((item) => `${item.neuronId} ${Math.round(item.activation * 100)}%`)
+    .join(", ");
+
+  return [
+    "## NEURAL_RUNTIME.md",
+    `dominantRoute: ${neuralState.dominantRoute}`,
+    `summary: ${neuralState.summary}`,
+    `broadcastSummary: ${neuralState.broadcastSummary || "-"}`,
+    `focus: ${Math.round(neuralState.modulators.focus * 100)}%`,
+    `novelty: ${Math.round(neuralState.modulators.novelty * 100)}%`,
+    `caution: ${Math.round(neuralState.modulators.caution * 100)}%`,
+    `supportingNeurons: ${supportingNeurons || "-"}`,
+    neuralState.memoryDirective.reason
+      ? `memoryDirective: ${neuralState.memoryDirective.reason}`
+      : "",
+    memoryLines ? `recentDurableMemories:\n${memoryLines}` : "",
+    "Let the dominant route shape the reply, but keep the output practical and direct.",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function mergeProviderSettings(
@@ -215,13 +280,27 @@ async function createConversationRecord(
 }
 
 function toThreadMemories(conversation: ConversationRecord): NeuralMemoryRecord[] {
-  return conversation.messages.slice(-12).map((message, index) => ({
-    id: `thread_${index + 1}`,
-    scope: "thread",
-    content: `${message.role}: ${message.content}`,
-    createdAt: message.createdAt,
-    sourceRoute: undefined,
-  }));
+  const memories: NeuralMemoryRecord[] = [];
+  if (conversation.compaction?.summary) {
+    memories.push({
+      id: "thread_compaction",
+      scope: "thread",
+      content: `[Compacted session summary]\n${conversation.compaction.summary}`,
+      createdAt: conversation.compaction.updatedAt,
+      sourceRoute: undefined,
+    });
+  }
+
+  return [
+    ...memories,
+    ...conversation.messages.slice(-10).map((message, index) => ({
+      id: `thread_${index + 1}`,
+      scope: "thread" as const,
+      content: `${message.role}: ${message.content}`,
+      createdAt: message.createdAt,
+      sourceRoute: undefined,
+    })),
+  ];
 }
 
 function normalizeMemoryText(value: string) {
@@ -636,6 +715,18 @@ async function getCharacterById(characterId: string) {
   return hydrateCharacter(character);
 }
 
+async function listCharacterAutomations(characterId: string) {
+  const store = await readStore();
+  const automations = store.automations
+    .filter((item) => item.characterId === characterId)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+  const runs = store.automationRuns
+    .filter((item) => item.characterId === characterId)
+    .sort((left, right) => right.createdAt - left.createdAt)
+    .slice(0, 20);
+  return { automations, runs };
+}
+
 app.get("/api/health", async (_req, res) => {
   const store = await readStore();
   res.json({
@@ -650,6 +741,213 @@ app.get("/api/characters", async (_req, res) => {
   const store = await readStore();
   const characters = await Promise.all(store.characters.map((item) => hydrateCharacter(item)));
   res.json({ characters });
+});
+
+app.get("/api/characters/:characterId/skills", async (req, res) => {
+  const characterId = String(req.params.characterId || "").trim();
+  const character = await getCharacterById(characterId);
+  if (!character) {
+    return res.status(404).json({ message: "Character not found" });
+  }
+
+  const skills = await resolveCharacterSkills(character);
+  res.json({ skills });
+});
+
+app.get("/api/skills/search", async (req, res) => {
+  try {
+    const query = String(req.query.query || "").trim();
+    if (!query) {
+      return res.json({ skills: [] });
+    }
+
+    const provider = await resolveProviderSettings();
+    const skills = await listSkillCatalog(query, providerToRuntimeConfig(provider));
+    res.json({ skills: skills.slice(0, 12) });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.post("/api/characters/:characterId/skills", async (req, res) => {
+  try {
+    const characterId = String(req.params.characterId || "").trim();
+    const skillId = String(req.body?.skillId || "").trim();
+    const packageRef = String(req.body?.packageRef || "").trim();
+    if (!characterId) throw new Error("characterId is required");
+    if (!skillId) throw new Error("skillId is required");
+
+    let updatedCharacter: CharacterRecord | null = null;
+    await updateStore(async (store) => {
+      updatedCharacter = await attachSkillToCharacter(
+        store,
+        characterId,
+        packageRef || skillId,
+      );
+    });
+
+    if (!updatedCharacter) {
+      return res.status(404).json({ message: "Character not found" });
+    }
+
+    const character = await hydrateCharacter(updatedCharacter);
+    const skills = await resolveCharacterSkills(character);
+    res.json({ character, skills });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.delete("/api/characters/:characterId/skills/:skillId", async (req, res) => {
+  try {
+    const characterId = String(req.params.characterId || "").trim();
+    const skillId = String(req.params.skillId || "").trim();
+    if (!characterId) throw new Error("characterId is required");
+    if (!skillId) throw new Error("skillId is required");
+
+    let updatedCharacter: CharacterRecord | null = null;
+    await updateStore((store) => {
+      updatedCharacter = detachSkillFromCharacter(store, characterId, skillId);
+    });
+    await removeWorkspaceSkill(characterId, skillId);
+
+    if (!updatedCharacter) {
+      return res.status(404).json({ message: "Character not found" });
+    }
+
+    const character = await hydrateCharacter(updatedCharacter);
+    const skills = await resolveCharacterSkills(character);
+    res.json({ character, skills });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.get("/api/characters/:characterId/automations", async (req, res) => {
+  const characterId = String(req.params.characterId || "").trim();
+  const character = await getCharacterById(characterId);
+  if (!character) {
+    return res.status(404).json({ message: "Character not found" });
+  }
+
+  const { automations, runs } = await listCharacterAutomations(characterId);
+  res.json({ automations, runs });
+});
+
+app.post("/api/characters/:characterId/automations", async (req, res) => {
+  try {
+    const characterId = String(req.params.characterId || "").trim();
+    if (!characterId) throw new Error("characterId is required");
+
+    const character = await getCharacterById(characterId);
+    if (!character) {
+      return res.status(404).json({ message: "Character not found" });
+    }
+
+    const input = ensureAutomationInput(req.body);
+    if (!input.name) throw new Error("Automation name is required");
+    if (!input.prompt) throw new Error("Automation prompt is required");
+
+    const automation = await createOrUpdateAutomation({
+      characterId,
+      name: input.name,
+      prompt: input.prompt,
+      intervalMinutes: input.intervalMinutes,
+      enabled: input.enabled,
+    });
+    const { automations, runs } = await listCharacterAutomations(characterId);
+    res.json({ automation, automations, runs });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.patch("/api/characters/:characterId/automations/:automationId", async (req, res) => {
+  try {
+    const characterId = String(req.params.characterId || "").trim();
+    const automationId = String(req.params.automationId || "").trim();
+    if (!characterId) throw new Error("characterId is required");
+    if (!automationId) throw new Error("automationId is required");
+
+    const store = await readStore();
+    const current = store.automations.find(
+      (item) => item.id === automationId && item.characterId === characterId,
+    );
+    if (!current) {
+      return res.status(404).json({ message: "Automation not found" });
+    }
+
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const input = ensureAutomationInput({
+      name: Object.prototype.hasOwnProperty.call(body, "name") ? body.name : current.name,
+      prompt: Object.prototype.hasOwnProperty.call(body, "prompt") ? body.prompt : current.prompt,
+      intervalMinutes: Object.prototype.hasOwnProperty.call(body, "intervalMinutes")
+        ? body.intervalMinutes
+        : current.intervalMinutes,
+      enabled: Object.prototype.hasOwnProperty.call(body, "enabled")
+        ? body.enabled
+        : current.enabled,
+    });
+
+    const automation = await createOrUpdateAutomation({
+      id: current.id,
+      characterId,
+      name: input.name,
+      prompt: input.prompt,
+      intervalMinutes: input.intervalMinutes,
+      enabled: input.enabled,
+    });
+    const { automations, runs } = await listCharacterAutomations(characterId);
+    res.json({ automation, automations, runs });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.post("/api/characters/:characterId/automations/:automationId/run", async (req, res) => {
+  try {
+    const characterId = String(req.params.characterId || "").trim();
+    const automationId = String(req.params.automationId || "").trim();
+    if (!characterId) throw new Error("characterId is required");
+    if (!automationId) throw new Error("automationId is required");
+
+    const store = await readStore();
+    const automation = store.automations.find(
+      (item) => item.id === automationId && item.characterId === characterId,
+    );
+    if (!automation) {
+      return res.status(404).json({ message: "Automation not found" });
+    }
+
+    const run = await runAutomationNow(automationId);
+    const { automations, runs } = await listCharacterAutomations(characterId);
+    res.json({ run, automations, runs });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.delete("/api/characters/:characterId/automations/:automationId", async (req, res) => {
+  try {
+    const characterId = String(req.params.characterId || "").trim();
+    const automationId = String(req.params.automationId || "").trim();
+    if (!characterId) throw new Error("characterId is required");
+    if (!automationId) throw new Error("automationId is required");
+
+    const store = await readStore();
+    const automation = store.automations.find(
+      (item) => item.id === automationId && item.characterId === characterId,
+    );
+    if (!automation) {
+      return res.status(404).json({ message: "Automation not found" });
+    }
+
+    await deleteAutomation(automationId);
+    const { automations, runs } = await listCharacterAutomations(characterId);
+    res.json({ ok: true, automations, runs });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
 });
 
 app.get("/api/settings/provider", async (_req, res) => {
@@ -973,7 +1271,20 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const provider = await resolveProviderSettings();
-    const conversation = await createConversationRecord(character, conversationId || undefined);
+    const providerConfig = providerToRuntimeConfig(provider);
+    const providerModel =
+      provider.providerMode === "glm-main"
+        ? provider.glmModel
+        : provider.model || provider.glmModel;
+    const command = parseChatCommand(message);
+    let conversation = await createConversationRecord(character, conversationId || undefined);
+    const compactionResult = await compactConversationIfNeeded({
+      conversation,
+      config: providerConfig,
+      force: command.type === "compact",
+      instructions: command.type === "compact" ? command.instructions : undefined,
+    });
+    conversation = compactionResult.conversation;
     const threadMemories = toThreadMemories(conversation);
     const globalMemories = Array.isArray(character.globalMemories) ? character.globalMemories : [];
     const neuralState = deriveNeuralStateSnapshot({
@@ -986,45 +1297,159 @@ app.post("/api/chat", async (req, res) => {
       globalMemories,
       runtimeSkills: [],
     });
-
-    const systemPrompt = buildCharacterRuntimeSystemPrompt({
-      bundleFiles: character.blueprint.bundleFiles,
-      definition: character.definition,
-      neuralState,
-      globalMemories: Array.isArray(character.globalMemories) ? character.globalMemories : [],
-    });
-
-    const history = conversation.messages.slice(-10).map((item) => ({
-      role: item.role,
-      content: item.content,
-    }));
-
-    const replyResult = await generateRoleReplyDetailed({
-      systemPrompt,
-      definition: character.definition,
-      history,
-      userMessage: message,
-      config: providerToRuntimeConfig(provider),
-    });
-
+    const history = buildConversationHistory(conversation);
     const userEntry = {
       id: randomId("msg"),
       role: "user" as const,
       content: message,
       createdAt: Date.now(),
     };
+
+    let workingCharacter = character;
+    let assistantReply = "";
+    let generation: GenerationTrace = {
+      mode: "persona-engine" as const,
+      providerMode: provider.providerMode,
+      model: providerModel,
+      reason: "runtime_command",
+    };
+    let toolEvents: Array<{
+      step: number;
+      tool: string;
+      arguments: Record<string, unknown>;
+      ok: boolean;
+      summary: string;
+    }> = [];
+
+    if (command.type === "compact") {
+      const summary = String(conversation.compaction?.summary || "").trim();
+      const preview = summary.length > 1200 ? `${summary.slice(0, 1200)}\n\n[truncated]` : summary;
+      assistantReply = compactionResult.compacted
+        ? [
+            "会话压缩已完成，后续轮次会优先使用摘要上下文。",
+            `- 汇总消息数：${conversation.compaction?.sourceMessageCount || 0}`,
+            `- 压缩次数：${conversation.compaction?.count || 1}`,
+            "",
+            preview,
+          ]
+            .filter(Boolean)
+            .join("\n")
+        : [
+            "当前会话还不够长，暂时跳过压缩。",
+            conversation.compaction?.summary
+              ? `已有压缩摘要，当前压缩次数：${conversation.compaction.count}。`
+              : "后续消息变长后会自动生成压缩摘要。",
+          ].join("\n");
+      generation.reason = "compact_conversation";
+    } else if (command.type === "list-skills") {
+      assistantReply = await formatSkillListReply(workingCharacter);
+      generation.reason = "list_skills";
+    } else if (command.type === "install-skill") {
+      await updateStore(async (store) => {
+        workingCharacter = await attachSkillToCharacter(
+          store,
+          character.id,
+          command.skillId,
+        );
+      });
+      workingCharacter = (await getCharacterById(character.id)) || workingCharacter;
+      assistantReply = [
+        `Attached skill: ${command.skillId}`,
+        "",
+        await formatSkillListReply(workingCharacter),
+      ].join("\n");
+      generation.reason = "install_skill";
+    } else if (command.type === "detach-skill") {
+      await updateStore((store) => {
+        workingCharacter = detachSkillFromCharacter(store, character.id, command.skillId);
+      });
+      await removeWorkspaceSkill(character.id, command.skillId);
+      workingCharacter = (await getCharacterById(character.id)) || workingCharacter;
+      assistantReply = [
+        `Detached skill: ${command.skillId}`,
+        "",
+        await formatSkillListReply(workingCharacter),
+      ].join("\n");
+      generation.reason = "detach_skill";
+    } else if (command.type === "search") {
+      const skills = await listSkillCatalog(command.query, providerConfig);
+      assistantReply = skills.length
+        ? [
+            `Search results for "${command.query}":`,
+            ...skills.slice(0, 8).map(
+              (skill) =>
+                `- ${skill.name} (${skill.id})${skill.packageRef ? ` · ${skill.packageRef}` : ""}: ${skill.description}`,
+            ),
+          ].join("\n")
+        : `No installable skills found for "${command.query}".`;
+      generation.reason = "search_skills";
+    } else {
+      const availableSkills = await resolveCharacterSkills(workingCharacter);
+      const attachedSkills = await loadAttachedSkills(workingCharacter, { limit: 6 });
+      const activeSkill =
+        command.type === "use-skill"
+          ? await loadActiveSkill(workingCharacter, command.skillId)
+          : null;
+
+      if (command.type === "use-skill" && !activeSkill) {
+        assistantReply = [
+          `Skill not attached: ${command.skillId}`,
+          "Open the Skills panel and attach it first, or use /install-skill.",
+        ].join("\n");
+        generation.reason = "missing_skill";
+      } else {
+        const systemPrompt = [
+          await buildRuntimeSystemPrompt({
+            character: workingCharacter,
+            availableSkills,
+            attachedSkills,
+            activeSkill,
+          }),
+          buildNeuralRuntimeSection({
+            neuralState,
+            globalMemories,
+          }),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+
+        const runtimeResult = await runRoleAgentTurn({
+          character: workingCharacter,
+          systemPrompt,
+          history,
+          userMessage: command.type === "use-skill" ? command.task : message,
+          config: providerConfig,
+          allowMutatingTools: true,
+        });
+
+        assistantReply = runtimeResult.reply;
+        generation = runtimeResult.generation;
+        toolEvents = runtimeResult.toolEvents || [];
+        workingCharacter = (await getCharacterById(character.id)) || workingCharacter;
+      }
+    }
+
+    generation = {
+      ...generation,
+      ...(compactionResult.summaryUsed ? { compacted: true } : {}),
+      ...(conversation.compaction?.count
+        ? { compactionCount: conversation.compaction.count }
+        : {}),
+    };
+
     const durableMemory = deriveDurableMemoryCandidate(message, neuralState);
     const assistantEntry = {
       id: randomId("msg"),
       role: "assistant" as const,
-      content: replyResult.reply,
+      content: assistantReply,
       createdAt: Date.now(),
-      generation: replyResult.generation,
+      generation,
       neuralRecord: buildAssistantNeuralRecord({
-        generation: replyResult.generation,
+        generation,
         neuralState,
         durableMemoryCandidate: durableMemory,
       }),
+      toolEvents,
     };
 
     const nextConversation: ConversationRecord = {
@@ -1037,11 +1462,11 @@ app.post("/api/chat", async (req, res) => {
     };
 
     const nextCharacter: CharacterRecord = {
-      ...character,
+      ...workingCharacter,
       updatedAt: Date.now(),
       lastNeuralState: neuralState as CharacterRecord["lastNeuralState"],
       globalMemories: appendGlobalMemory(
-        Array.isArray(character.globalMemories) ? character.globalMemories : [],
+        Array.isArray(workingCharacter.globalMemories) ? workingCharacter.globalMemories : [],
         durableMemory,
         neuralState.dominantRoute,
       ),
@@ -1056,7 +1481,8 @@ app.post("/api/chat", async (req, res) => {
       character: nextCharacter,
       conversation: nextConversation,
       neuralState,
-      generation: replyResult.generation,
+      generation,
+      toolEvents,
     });
   } catch (error: any) {
     res.status(400).json({ message: String(error?.message || error) });
@@ -1073,6 +1499,14 @@ app.get("*", async (_req, res) => {
   } catch {
     res.status(404).send("liberth-neural client is not built yet.");
   }
+});
+
+void initializeAutomationScheduler({
+  resolveCharacter: getCharacterById,
+  resolveProviderSettings,
+  providerToRuntimeConfig,
+}).catch((error) => {
+  console.error("failed to initialize automation scheduler", error);
 });
 
 app.listen(port, () => {

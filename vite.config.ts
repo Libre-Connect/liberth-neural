@@ -1,6 +1,16 @@
 import path from "path";
+import { webcrypto } from "node:crypto";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+
+// Vite 5 expects Web Crypto on globalThis. Node 16 exposes it via node:crypto.webcrypto
+// but does not always wire it to the global object.
+if (!globalThis.crypto?.getRandomValues) {
+  Object.defineProperty(globalThis, "crypto", {
+    value: webcrypto,
+    configurable: true,
+  });
+}
 
 export default defineConfig({
   plugins: [react()],

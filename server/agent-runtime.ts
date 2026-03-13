@@ -4,7 +4,16 @@ import type {
   CharacterRecord,
   SearchResultRecord,
 } from "../src/types";
-import type { CompletionTrace, LlmRuntimeConfig } from "./llm";
+import type {
+  CompletionTrace,
+  LlmConversationMessage,
+  LlmRuntimeConfig,
+  LlmToolDefinition,
+} from "./llm";
+import {
+  completeTextWithToolsDetailed,
+  supportsNativeToolCalling,
+} from "./llm";
 import { generateRoleReplyDetailed } from "./roles";
 import { searchWeb } from "./search";
 import {
@@ -47,6 +56,29 @@ type ToolExecutionResult = {
   automation?: AutomationRecord;
 };
 
+type RoleAgentTurnInput = {
+  character: CharacterRecord;
+  systemPrompt: string;
+  history: Array<{ role: "user" | "assistant"; content: string }>;
+  userMessage: string;
+  config?: LlmRuntimeConfig;
+  allowMutatingTools?: boolean;
+};
+
+type RoleAgentTurnResult = {
+  reply: string;
+  generation: CompletionTrace;
+  toolEvents: ToolEvent[];
+  searchResults: SearchResultRecord[];
+};
+
+type ToolSpec = {
+  name: ToolName;
+  args: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+};
+
 const TOOL_LOOP_MAX_STEPS = 4;
 const TOOL_RESULT_CHAR_LIMIT = 12_000;
 const SKILL_CONTENT_CHAR_LIMIT = 8_000;
@@ -67,39 +99,89 @@ function normalizePositiveInt(value: unknown, fallback: number, max: number) {
   return Math.max(1, Math.min(max, Math.round(parsed)));
 }
 
-function buildToolPrompt(allowMutatingTools: boolean) {
-  const tools = [
+function buildToolSpecs(allowMutatingTools: boolean): ToolSpec[] {
+  return [
     {
       name: "web_search",
       args: '{ "query": "string", "count": 1-8, "language": "optional string" }',
       description: "Search the web and return result snippets with URLs.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          count: { type: "integer", minimum: 1, maximum: 8 },
+          language: { type: "string" },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
     },
     {
       name: "search_skills",
       args: '{ "query": "string" }',
       description: "Use AI to rewrite a software capability need into search keywords, then search installable external skills.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
     },
     {
       name: "list_attached_skills",
       args: "{}",
       description: "List skills already attached to this character workspace.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     },
     {
       name: "read_skill",
       args: '{ "skillId": "string" }',
       description: "Read the selected skill instructions so you can use it correctly.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          skillId: { type: "string" },
+        },
+        required: ["skillId"],
+        additionalProperties: false,
+      },
     },
     ...(allowMutatingTools
       ? [
           {
-            name: "install_skill",
+            name: "install_skill" as const,
             args: '{ "skillId": "string", "packageRef": "optional owner/repo@skill string" }',
             description: "Install and attach a visible skill into this character workspace. Use packageRef for external search results.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                skillId: { type: "string" },
+                packageRef: { type: "string" },
+              },
+              required: ["skillId"],
+              additionalProperties: false,
+            },
           },
           {
-            name: "create_automation",
+            name: "create_automation" as const,
             args: '{ "name": "string", "prompt": "string", "intervalMinutes": number }',
             description: "Create a recurring automation for this character.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                prompt: { type: "string" },
+                intervalMinutes: { type: "integer", minimum: 1, maximum: 10080 },
+              },
+              required: ["name", "prompt", "intervalMinutes"],
+              additionalProperties: false,
+            },
           },
         ]
       : []),
@@ -107,9 +189,17 @@ function buildToolPrompt(allowMutatingTools: boolean) {
       name: "list_automations",
       args: "{}",
       description: "List automations already configured for this character.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     },
   ];
+}
 
+function buildLegacyToolPrompt(allowMutatingTools: boolean) {
+  const tools = buildToolSpecs(allowMutatingTools);
   return [
     "## BUILTIN_TOOLS.md",
     "You are running inside an OpenClaw-like tool runtime with typed built-in tools.",
@@ -127,6 +217,31 @@ function buildToolPrompt(allowMutatingTools: boolean) {
       (tool) => `- ${tool.name}: ${tool.description} Args: ${tool.args}`,
     ),
   ].join("\n");
+}
+
+function buildNativeToolPrompt(allowMutatingTools: boolean) {
+  const tools = buildToolSpecs(allowMutatingTools);
+  return [
+    "## BUILTIN_TOOLS.md",
+    "You are running inside an OpenClaw-like tool runtime with typed built-in tools.",
+    "When a tool is genuinely needed, call exactly one native tool.",
+    "Wait for the tool result before requesting another tool.",
+    "Do not claim tool execution without a real tool result.",
+    "If no tool is needed, answer normally.",
+    "Prefer no more than 3 tool calls before the final answer.",
+    "Available tools:",
+    ...tools.map(
+      (tool) => `- ${tool.name}: ${tool.description} Args: ${tool.args}`,
+    ),
+  ].join("\n");
+}
+
+function buildNativeTools(allowMutatingTools: boolean): LlmToolDefinition[] {
+  return buildToolSpecs(allowMutatingTools).map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }));
 }
 
 function parseJsonBlock(rawValue: string) {
@@ -213,6 +328,31 @@ function formatToolResultBlock(
     `arguments: ${serializeJson(args)}`,
     truncateText(result.summary, TOOL_RESULT_CHAR_LIMIT),
     "</tool_result>",
+  ].join("\n");
+}
+
+function fallbackReplyText(input: {
+  character: CharacterRecord;
+  historyCount: number;
+  userMessage: string;
+}) {
+  const language = String(input.character.definition.language || "").toLowerCase();
+  const prefersChinese = language.includes("zh") || language.includes("chinese");
+  if (prefersChinese) {
+    return [
+      "我会继续沿用当前 bundle 和角色设定来回答。",
+      `你刚才的问题是：“${input.userMessage}”。`,
+      input.historyCount > 0
+        ? `我已经保留这段会话里的最近 ${input.historyCount} 轮上下文。`
+        : "这是当前会话的第一轮输入。",
+    ].join("\n");
+  }
+  return [
+    "I will continue through the current bundle and role definition.",
+    `Your latest message was: "${input.userMessage}".`,
+    input.historyCount > 0
+      ? `I am carrying the latest ${input.historyCount} turns of context into this reply.`
+      : "This is the first message in the current conversation.",
   ].join("\n");
 }
 
@@ -401,16 +541,11 @@ async function executeTool(
   }
 }
 
-export async function runRoleAgentTurn(input: {
-  character: CharacterRecord;
-  systemPrompt: string;
-  history: Array<{ role: "user" | "assistant"; content: string }>;
-  userMessage: string;
-  config?: LlmRuntimeConfig;
-  allowMutatingTools?: boolean;
-}) {
-  const allowMutatingTools = input.allowMutatingTools !== false;
-  const toolPrompt = buildToolPrompt(allowMutatingTools);
+async function runLegacyToolLoop(
+  input: RoleAgentTurnInput,
+  allowMutatingTools: boolean,
+): Promise<RoleAgentTurnResult> {
+  const toolPrompt = buildLegacyToolPrompt(allowMutatingTools);
   const scratchHistory = [...input.history];
   const toolEvents: ToolEvent[] = [];
   const aggregatedSearchResults: SearchResultRecord[] = [];
@@ -539,4 +674,196 @@ export async function runRoleAgentTurn(input: {
     toolEvents,
     searchResults: dedupeSearchResults(aggregatedSearchResults),
   };
+}
+
+async function runNativeToolLoop(
+  input: RoleAgentTurnInput,
+  allowMutatingTools: boolean,
+): Promise<RoleAgentTurnResult | null> {
+  const nativeToolPrompt = buildNativeToolPrompt(allowMutatingTools);
+  const legacyToolPrompt = buildLegacyToolPrompt(allowMutatingTools);
+  const nativeTools = buildNativeTools(allowMutatingTools);
+  const allowedToolNames = new Set(nativeTools.map((tool) => tool.name));
+  const scratchHistory = [...input.history];
+  const nativeMessages: LlmConversationMessage[] = [
+    {
+      role: "system",
+      content: `${input.systemPrompt}\n\n${nativeToolPrompt}`,
+    },
+    ...input.history.map((message) => ({
+      role: message.role,
+      content: message.content,
+    })),
+    {
+      role: "user",
+      content: input.userMessage,
+    },
+  ];
+  const toolEvents: ToolEvent[] = [];
+  const aggregatedSearchResults: SearchResultRecord[] = [];
+  const seenToolCalls = new Set<string>();
+  let lastGeneration: CompletionTrace | undefined;
+  let shouldFinalize = false;
+
+  for (let step = 1; step <= TOOL_LOOP_MAX_STEPS; step += 1) {
+    const result = await completeTextWithToolsDetailed({
+      messages: nativeMessages,
+      tools: nativeTools,
+      fallback: () =>
+        fallbackReplyText({
+          character: input.character,
+          historyCount: input.history.length,
+          userMessage: input.userMessage,
+        }),
+      config: input.config,
+    });
+    lastGeneration = result.trace;
+
+    if (!result.toolCall) {
+      if (step === 1 && result.trace.mode === "fallback") {
+        return null;
+      }
+      return {
+        reply: result.value,
+        generation: result.trace,
+        toolEvents,
+        searchResults: dedupeSearchResults(aggregatedSearchResults),
+      };
+    }
+
+    const toolName = String(result.toolCall.name || "").trim() as ToolName;
+    const toolArguments =
+      result.toolCall.arguments && typeof result.toolCall.arguments === "object"
+        ? result.toolCall.arguments
+        : {};
+    const signature = `${toolName}:${JSON.stringify(toolArguments)}`;
+    if (seenToolCalls.has(signature)) {
+      shouldFinalize = true;
+      break;
+    }
+    seenToolCalls.add(signature);
+
+    const toolResult = allowedToolNames.has(toolName)
+      ? await executeTool(toolName, toolArguments, {
+          character: input.character,
+          config: input.config,
+          allowMutatingTools,
+        })
+      : {
+          ok: false,
+          summary: `Unknown tool: ${toolName}`,
+        };
+
+    if (Array.isArray(toolResult.searchResults)) {
+      aggregatedSearchResults.push(...toolResult.searchResults);
+    }
+
+    toolEvents.push({
+      step,
+      tool: toolName,
+      arguments: toolArguments,
+      ok: toolResult.ok,
+      summary: truncateText(toolResult.summary, 1200),
+    });
+
+    nativeMessages.push({
+      role: "assistant",
+      content: result.value || "",
+      toolCalls: [
+        {
+          name: toolName,
+          arguments: toolArguments,
+          callId: result.toolCall.callId,
+        },
+      ],
+    });
+    nativeMessages.push({
+      role: "tool",
+      content: truncateText(toolResult.summary, TOOL_RESULT_CHAR_LIMIT),
+      toolName,
+      toolCallId: result.toolCall.callId,
+    });
+
+    scratchHistory.push({
+      role: "assistant",
+      content: `<tool_call>${serializeJson({
+        tool: toolName,
+        arguments: toolArguments,
+      })}</tool_call>`,
+    });
+    scratchHistory.push({
+      role: "assistant",
+      content: formatToolResultBlock(toolName, toolArguments, toolResult),
+    });
+  }
+
+  if (toolEvents.length > 0 || shouldFinalize) {
+    const finalResult = await generateRoleReplyDetailed({
+      systemPrompt: [
+        input.systemPrompt,
+        legacyToolPrompt,
+        "## TOOL_FINALIZATION.md",
+        "Native tool execution phase is complete.",
+        "Do not call any more tools.",
+        "Summarize completed tool actions and answer the user directly.",
+      ].join("\n\n"),
+      history: scratchHistory,
+      userMessage: input.userMessage,
+      config: input.config,
+    });
+
+    if (!extractToolCall(finalResult.reply)) {
+      return {
+        reply: finalResult.reply,
+        generation: {
+          ...finalResult.generation,
+          nativeTools: true,
+        },
+        toolEvents,
+        searchResults: dedupeSearchResults(aggregatedSearchResults),
+      };
+    }
+  }
+
+  return {
+    reply:
+      toolEvents.length > 0
+        ? [
+            "我已经完成工具调用，但模型在原生工具模式下没有稳定收口。",
+            "已完成的动作：",
+            ...toolEvents.map(
+              (event) =>
+                `- ${event.tool}: ${event.ok ? "success" : "error"} - ${event.summary}`,
+            ),
+          ].join("\n")
+        : [
+            "我已经尝试原生工具模式，但没有收敛到稳定答案。",
+            "请缩小范围，或者直接指定你要我搜索、安装 skill、还是创建定时任务。",
+          ].join("\n"),
+    generation: {
+      ...(lastGeneration ||
+        ({
+          mode: "fallback",
+          providerMode: "glm-main",
+          model: "glm-4-flash-250414",
+          reason: "native_tool_loop_limit",
+        } satisfies CompletionTrace)),
+      nativeTools: true,
+    },
+    toolEvents,
+    searchResults: dedupeSearchResults(aggregatedSearchResults),
+  };
+}
+
+export async function runRoleAgentTurn(input: RoleAgentTurnInput) {
+  const allowMutatingTools = input.allowMutatingTools !== false;
+
+  if (supportsNativeToolCalling(input.config)) {
+    const nativeResult = await runNativeToolLoop(input, allowMutatingTools);
+    if (nativeResult) {
+      return nativeResult;
+    }
+  }
+
+  return runLegacyToolLoop(input, allowMutatingTools);
 }

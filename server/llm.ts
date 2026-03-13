@@ -7,6 +7,35 @@ type ChatMessage = {
   content: string;
 };
 
+export type LlmToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+};
+
+export type LlmToolCall = {
+  name: string;
+  arguments: Record<string, unknown>;
+  callId?: string;
+};
+
+export type LlmConversationMessage =
+  | {
+      role: "system" | "user";
+      content: string;
+    }
+  | {
+      role: "assistant";
+      content: string;
+      toolCalls?: LlmToolCall[];
+    }
+  | {
+      role: "tool";
+      content: string;
+      toolName: string;
+      toolCallId?: string;
+    };
+
 type ProviderApiStyle = "glm-main" | "openai-compatible" | "anthropic" | "google-gemini";
 type GenerationMode = "llm" | "fallback";
 
@@ -28,6 +57,16 @@ export type CompletionTrace = {
   providerMode: ProviderMode;
   model: string;
   reason?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  nativeTools?: boolean;
+};
+
+type UsageSnapshot = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
 };
 
 function resolveEnv(name: string, fallback = "") {
@@ -138,6 +177,95 @@ function resolveTrace(config?: LlmRuntimeConfig, mode: GenerationMode = "llm", r
     model: runtime.providerMode === "glm-main" ? runtime.glmModel : runtime.model,
     ...(reason ? { reason } : {}),
   };
+}
+
+function resolveTraceWithUsage(
+  config: LlmRuntimeConfig | undefined,
+  mode: GenerationMode,
+  options?: {
+    reason?: string;
+    usage?: UsageSnapshot;
+    nativeTools?: boolean;
+  },
+): CompletionTrace {
+  return {
+    ...resolveTrace(config, mode, options?.reason),
+    ...(options?.usage || {}),
+    ...(options?.nativeTools === undefined ? {} : { nativeTools: options.nativeTools }),
+  };
+}
+
+function normalizeUsage(
+  input?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  } | null,
+): UsageSnapshot {
+  if (!input || typeof input !== "object") {
+    return {};
+  }
+
+  const inputTokens = Number(
+    input.prompt_tokens ?? input.input_tokens ?? input.promptTokenCount ?? 0,
+  );
+  const outputTokens = Number(
+    input.completion_tokens ?? input.output_tokens ?? input.candidatesTokenCount ?? 0,
+  );
+  const totalTokens = Number(
+    input.total_tokens ?? input.totalTokenCount ?? (inputTokens + outputTokens) ?? 0,
+  );
+
+  return {
+    ...(Number.isFinite(inputTokens) && inputTokens > 0 ? { inputTokens } : {}),
+    ...(Number.isFinite(outputTokens) && outputTokens > 0 ? { outputTokens } : {}),
+    ...(Number.isFinite(totalTokens) && totalTokens > 0 ? { totalTokens } : {}),
+  };
+}
+
+function safeParseToolArguments(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string") {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeOpenAiTextContent(content: unknown) {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((item: any) => String(item?.text || item?.content || "").trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function supportsNativeToolCalling(config?: LlmRuntimeConfig) {
+  const runtime = resolveRuntimeConfig(config);
+  return (
+    runtime.apiStyle === "openai-compatible" ||
+    runtime.apiStyle === "anthropic" ||
+    runtime.apiStyle === "google-gemini" ||
+    runtime.apiStyle === "glm-main"
+  );
 }
 
 export function hasLlmAccess(config?: LlmRuntimeConfig) {
@@ -367,6 +495,420 @@ async function runProviderChat(
     case "openai-compatible":
     default:
       return openAiCompatibleChat(messages, mode, config);
+  }
+}
+
+function toOpenAiToolSchema(tool: LlmToolDefinition) {
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.inputSchema,
+    },
+  };
+}
+
+function mapOpenAiConversationMessages(messages: LlmConversationMessage[]) {
+  return messages.map((message) => {
+    if (message.role === "tool") {
+      return {
+        role: "tool",
+        tool_call_id: message.toolCallId || message.toolName,
+        content: message.content,
+      };
+    }
+
+    if (message.role === "assistant" && Array.isArray(message.toolCalls) && message.toolCalls.length) {
+      return {
+        role: "assistant",
+        content: message.content || null,
+        tool_calls: message.toolCalls.map((toolCall) => ({
+          id: toolCall.callId || `${toolCall.name}_call`,
+          type: "function",
+          function: {
+            name: toolCall.name,
+            arguments: JSON.stringify(toolCall.arguments || {}),
+          },
+        })),
+      };
+    }
+
+    return {
+      role: message.role,
+      content: message.content,
+    };
+  });
+}
+
+async function openAiCompatibleChatWithTools(
+  messages: LlmConversationMessage[],
+  tools: LlmToolDefinition[],
+  config?: LlmRuntimeConfig,
+) {
+  const runtime = resolveRuntimeConfig(config);
+  const isGlmMain = runtime.apiStyle === "glm-main";
+  const requiresApiKey = runtime.providerMode !== "ollama";
+  if (requiresApiKey && !runtime.apiKey) {
+    throw new Error(`${runtime.providerMode} API key is not configured`);
+  }
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (runtime.apiKey) {
+    headers.Authorization = `Bearer ${runtime.apiKey}`;
+  }
+  if (runtime.providerMode === "openrouter") {
+    headers["HTTP-Referer"] = resolveEnv(
+      "PUBLIC_BASE_URL",
+      "https://github.com/Libre-Connect/liberth-neural",
+    );
+    headers["X-Title"] = "Liberth Neural";
+  }
+
+  const response = await fetch(
+    isGlmMain ? `${ZHIPUAI_BASE_URL}/chat/completions` : `${runtime.baseUrl}/chat/completions`,
+    {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: isGlmMain ? runtime.glmModel : runtime.model,
+      temperature: 0.8,
+      messages: mapOpenAiConversationMessages(messages),
+      ...(tools.length
+        ? {
+            tools: tools.map(toOpenAiToolSchema),
+            tool_choice: "auto",
+          }
+        : {}),
+    }),
+    },
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`LLM tool request failed (${response.status}): ${text.slice(0, 300)}`);
+  }
+
+  const payload = (await response.json()) as any;
+  const message = payload?.choices?.[0]?.message || {};
+  const toolCall = message?.tool_calls?.[0]
+    ? {
+        name: String(message.tool_calls[0]?.function?.name || "").trim(),
+        arguments: safeParseToolArguments(message.tool_calls[0]?.function?.arguments),
+        callId: String(message.tool_calls[0]?.id || "").trim() || undefined,
+      }
+    : null;
+
+  return {
+    content: normalizeOpenAiTextContent(message?.content),
+    toolCall,
+    usage: normalizeUsage(payload?.usage),
+  };
+}
+
+function mapAnthropicConversation(messages: LlmConversationMessage[]) {
+  const system = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .join("\n\n")
+    .trim();
+
+  const conversation = messages
+    .filter((message) => message.role !== "system")
+    .map((message) => {
+      if (message.role === "tool") {
+        return {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: message.toolCallId || message.toolName,
+              content: message.content,
+              is_error: false,
+            },
+          ],
+        };
+      }
+
+      if (message.role === "assistant" && Array.isArray(message.toolCalls) && message.toolCalls.length) {
+        const blocks: any[] = [];
+        if (message.content.trim()) {
+          blocks.push({ type: "text", text: message.content.trim() });
+        }
+        for (const toolCall of message.toolCalls) {
+          blocks.push({
+            type: "tool_use",
+            id: toolCall.callId || `${toolCall.name}_call`,
+            name: toolCall.name,
+            input: toolCall.arguments || {},
+          });
+        }
+        return {
+          role: "assistant",
+          content: blocks,
+        };
+      }
+
+      return {
+        role: message.role === "assistant" ? "assistant" : "user",
+        content: message.content,
+      };
+    });
+
+  return { system, conversation };
+}
+
+async function anthropicChatWithTools(
+  messages: LlmConversationMessage[],
+  tools: LlmToolDefinition[],
+  config?: LlmRuntimeConfig,
+) {
+  const runtime = resolveRuntimeConfig(config);
+  if (!runtime.apiKey) {
+    throw new Error("ANTHROPIC_API_KEY is not configured");
+  }
+
+  const mapped = mapAnthropicConversation(messages);
+  const response = await fetch(`${runtime.baseUrl}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": runtime.apiKey,
+      "anthropic-version": runtime.anthropicVersion,
+    },
+    body: JSON.stringify({
+      model: runtime.model,
+      system: mapped.system || undefined,
+      messages: mapped.conversation,
+      temperature: 0.8,
+      max_tokens: 1000,
+      ...(tools.length
+        ? {
+            tools: tools.map((tool) => ({
+              name: tool.name,
+              description: tool.description,
+              input_schema: tool.inputSchema,
+            })),
+          }
+        : {}),
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Anthropic tool request failed (${response.status}): ${text.slice(0, 300)}`);
+  }
+
+  const payload = (await response.json()) as any;
+  const blocks = Array.isArray(payload?.content) ? payload.content : [];
+  const text = blocks
+    .filter((block: any) => String(block?.type || "").trim() === "text")
+    .map((block: any) => String(block?.text || "").trim())
+    .filter(Boolean)
+    .join("\n");
+  const toolUse = blocks.find((block: any) => String(block?.type || "").trim() === "tool_use");
+
+  return {
+    content: text,
+    toolCall: toolUse
+      ? {
+          name: String(toolUse.name || "").trim(),
+          arguments:
+            toolUse.input && typeof toolUse.input === "object" && !Array.isArray(toolUse.input)
+              ? toolUse.input
+              : {},
+          callId: String(toolUse.id || "").trim() || undefined,
+        }
+      : null,
+    usage: normalizeUsage(payload?.usage),
+  };
+}
+
+function mapGeminiConversation(messages: LlmConversationMessage[]) {
+  const system = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .join("\n\n")
+    .trim();
+
+  const contents = messages
+    .filter((message) => message.role !== "system")
+    .map((message) => {
+      if (message.role === "tool") {
+        return {
+          role: "user",
+          parts: [
+            {
+              functionResponse: {
+                name: message.toolName,
+                response: {
+                  name: message.toolName,
+                  content: message.content,
+                },
+              },
+            },
+          ],
+        };
+      }
+
+      if (message.role === "assistant" && Array.isArray(message.toolCalls) && message.toolCalls.length) {
+        const parts: any[] = [];
+        if (message.content.trim()) {
+          parts.push({ text: message.content.trim() });
+        }
+        for (const toolCall of message.toolCalls) {
+          parts.push({
+            functionCall: {
+              name: toolCall.name,
+              args: toolCall.arguments || {},
+            },
+          });
+        }
+        return {
+          role: "model",
+          parts,
+        };
+      }
+
+      return {
+        role: message.role === "assistant" ? "model" : "user",
+        parts: [{ text: message.content }],
+      };
+    });
+
+  return { system, contents };
+}
+
+async function googleGeminiChatWithTools(
+  messages: LlmConversationMessage[],
+  tools: LlmToolDefinition[],
+  config?: LlmRuntimeConfig,
+) {
+  const runtime = resolveRuntimeConfig(config);
+  if (!runtime.apiKey) {
+    throw new Error("GOOGLE_API_KEY is not configured");
+  }
+
+  const mapped = mapGeminiConversation(messages);
+  const response = await fetch(
+    `${runtime.baseUrl}/models/${encodeURIComponent(runtime.model)}:generateContent?key=${encodeURIComponent(runtime.apiKey)}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        ...(mapped.system
+          ? {
+              systemInstruction: {
+                parts: [{ text: mapped.system }],
+              },
+            }
+          : {}),
+        contents: mapped.contents,
+        generationConfig: {
+          temperature: 0.8,
+          maxOutputTokens: 1000,
+        },
+        ...(tools.length
+          ? {
+              tools: [
+                {
+                  functionDeclarations: tools.map((tool) => ({
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.inputSchema,
+                  })),
+                },
+              ],
+              toolConfig: {
+                functionCallingConfig: {
+                  mode: "AUTO",
+                },
+              },
+            }
+          : {}),
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Gemini tool request failed (${response.status}): ${text.slice(0, 300)}`);
+  }
+
+  const payload = (await response.json()) as any;
+  const parts = Array.isArray(payload?.candidates?.[0]?.content?.parts)
+    ? payload.candidates[0].content.parts
+    : [];
+  const content = parts
+    .map((part: any) => String(part?.text || "").trim())
+    .filter(Boolean)
+    .join("\n");
+  const functionCallPart = parts.find((part: any) => part?.functionCall);
+
+  return {
+    content,
+    toolCall: functionCallPart?.functionCall
+      ? {
+          name: String(functionCallPart.functionCall.name || "").trim(),
+          arguments:
+            functionCallPart.functionCall.args
+            && typeof functionCallPart.functionCall.args === "object"
+            && !Array.isArray(functionCallPart.functionCall.args)
+              ? functionCallPart.functionCall.args
+              : {},
+        }
+      : null,
+    usage: normalizeUsage(payload?.usageMetadata),
+  };
+}
+
+export async function completeTextWithToolsDetailed(params: {
+  messages: LlmConversationMessage[];
+  tools: LlmToolDefinition[];
+  fallback: () => string;
+  config?: LlmRuntimeConfig;
+}): Promise<{ value: string; trace: CompletionTrace; toolCall: LlmToolCall | null }> {
+  if (!hasLlmAccess(params.config)) {
+    return {
+      value: params.fallback(),
+      trace: resolveTraceWithUsage(params.config, "fallback", {
+        reason: "no_llm_access",
+        nativeTools: true,
+      }),
+      toolCall: null,
+    };
+  }
+
+  try {
+    const runtime = resolveRuntimeConfig(params.config);
+    const result =
+      runtime.apiStyle === "anthropic"
+        ? await anthropicChatWithTools(params.messages, params.tools, params.config)
+        : runtime.apiStyle === "google-gemini"
+          ? await googleGeminiChatWithTools(params.messages, params.tools, params.config)
+          : await openAiCompatibleChatWithTools(params.messages, params.tools, params.config);
+
+    return {
+      value: result.content || params.fallback(),
+      trace: resolveTraceWithUsage(params.config, "llm", {
+        usage: result.usage,
+        nativeTools: true,
+      }),
+      toolCall: result.toolCall && result.toolCall.name ? result.toolCall : null,
+    };
+  } catch (error: any) {
+    return {
+      value: params.fallback(),
+      trace: resolveTraceWithUsage(params.config, "fallback", {
+        reason: String(error?.message || error || "native_tool_request_failed"),
+        nativeTools: true,
+      }),
+      toolCall: null,
+    };
   }
 }
 

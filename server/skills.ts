@@ -22,7 +22,8 @@ type ChatCommand =
   | { type: "install-skill"; skillId: string }
   | { type: "detach-skill"; skillId: string }
   | { type: "use-skill"; skillId: string; task: string }
-  | { type: "search"; query: string };
+  | { type: "search"; query: string }
+  | { type: "compact"; instructions?: string };
 
 type SkillSource = "workspace" | "local" | "bundled";
 const execFileAsync = promisify(execFile);
@@ -541,6 +542,16 @@ export function parseChatCommand(message: string): ChatCommand {
     input.match(/^(?:搜索|search)\s+([\s\S]+)$/i);
   if (searchMatch) {
     return { type: "search", query: searchMatch[1].trim() };
+  }
+
+  const compactMatch =
+    input.match(/^\/compact(?:\s+([\s\S]+))?$/i) ||
+    input.match(/^压缩会话(?:\s+([\s\S]+))?$/i);
+  if (compactMatch) {
+    return {
+      type: "compact",
+      instructions: String(compactMatch[1] || "").trim() || undefined,
+    };
   }
 
   return { type: "none" };
