@@ -901,7 +901,7 @@ export function createLocalNeuralBlueprint(definition: RoleDefinitionInput) {
     `Communication Preferences: ${definition.tone || "clear and direct"}`,
     `Favorite Topics: ${definition.domain || "problem solving"}`,
     `Relationship Contract: ${definition.goals || "Understand the user and respond in character."}`,
-    `Language Style: ${definition.language || "Chinese"}`,
+    `Language Style: ${definition.language || "English"}`,
     definition.knowledge ? `Knowledge Pack: ${definition.knowledge}` : "",
   ].filter(Boolean);
 

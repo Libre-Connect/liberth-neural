@@ -8,6 +8,7 @@ import {
   emptyProviderSettings,
   emptyRoleDefinition,
   getProviderCatalogItem,
+  type NeuralMemoryRecord,
   type NeuralRecord,
   providerCatalog,
   type ProviderMode,
@@ -16,9 +17,17 @@ import {
   type RoleDefinitionInput,
 } from "./types";
 
+type AppSection = "characters" | "chat" | "settings";
+type StudioMode = "create" | "edit";
+
 type ChatPayload = {
   character: CharacterRecord;
   conversation: ConversationRecord;
+};
+
+type CharacterComposePayload = {
+  definition: RoleDefinitionInput;
+  blueprint: RoleBlueprint;
 };
 
 type TelegramDraft = {
@@ -44,8 +53,10 @@ type WebhookDraft = {
   enabled: boolean;
 };
 
-const timeFormatter = new Intl.DateTimeFormat("zh-CN", {
-  hour: "2-digit",
+const timeFormatter = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
   minute: "2-digit",
 });
 
@@ -88,7 +99,7 @@ function formatTime(value: number) {
   try {
     return timeFormatter.format(new Date(value));
   } catch {
-    return "--:--";
+    return "--";
   }
 }
 
@@ -133,12 +144,12 @@ function formatChannelName(channel: DeploymentChannel) {
 
 function describeChannel(channel: DeploymentChannel) {
   if (channel === "webhook") {
-    return "Post the full neural payload to an external URL.";
+    return "Post the neural payload to an external URL.";
   }
   if (channel === "slack") {
-    return "Send a route summary into a Slack channel via bot token.";
+    return "Send a route summary into a Slack channel.";
   }
-  return "Send a route summary into a Telegram chat via bot token.";
+  return "Send a route summary into a Telegram chat.";
 }
 
 function describeDeploymentTarget(deployment: DeploymentRecord) {
@@ -149,6 +160,17 @@ function describeDeploymentTarget(deployment: DeploymentRecord) {
     return deployment.slack?.channelId || "No Slack channel";
   }
   return deployment.telegram?.chatId || "No Telegram chat";
+}
+
+function conversationSnippet(conversation: ConversationRecord) {
+  const latestUser = [...conversation.messages]
+    .reverse()
+    .find((message) => message.role === "user");
+  return latestUser?.content || conversation.messages[0]?.content || "New chat";
+}
+
+function sortConversations(conversations: ConversationRecord[]) {
+  return conversations.slice().sort((left, right) => right.updatedAt - left.updatedAt);
 }
 
 function downloadText(fileName: string, text: string, mimeType: string) {
@@ -162,15 +184,22 @@ function downloadText(fileName: string, text: string, mimeType: string) {
 }
 
 export default function App() {
+  const [appSection, setAppSection] = useState<AppSection>("characters");
+  const [studioMode, setStudioMode] = useState<StudioMode>("create");
   const [characters, setCharacters] = useState<CharacterRecord[]>([]);
   const [selectedCharacterId, setSelectedCharacterId] = useState("");
+  const [conversations, setConversations] = useState<ConversationRecord[]>([]);
+  const [selectedConversationId, setSelectedConversationId] = useState("");
+  const [characterBrief, setCharacterBrief] = useState("");
   const [definition, setDefinition] = useState<RoleDefinitionInput>(emptyRoleDefinition);
   const [blueprintPreview, setBlueprintPreview] = useState<RoleBlueprint | null>(null);
-  const [conversation, setConversation] = useState<ConversationRecord | null>(null);
+  const [showAdvancedBuilder, setShowAdvancedBuilder] = useState(false);
   const [chatText, setChatText] = useState("");
   const [studioBusy, setStudioBusy] = useState(false);
   const [studioError, setStudioError] = useState("");
+  const [studioSaved, setStudioSaved] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
+  const [chatError, setChatError] = useState("");
   const [providerSettings, setProviderSettings] =
     useState<ProviderSettings>(emptyProviderSettings);
   const [settingsBusy, setSettingsBusy] = useState(false);
@@ -190,68 +219,55 @@ export default function App() {
     () => characters.find((item) => item.id === selectedCharacterId) || null,
     [characters, selectedCharacterId],
   );
-  const displayedBlueprint = blueprintPreview || selectedCharacter?.blueprint || null;
-  const currentMessages = conversation?.messages || [];
-  const latestAssistantRecord = useMemo(() => {
-    for (let index = currentMessages.length - 1; index >= 0; index -= 1) {
-      const message = currentMessages[index];
-      if (message.role === "assistant" && message.neuralRecord) {
-        return message.neuralRecord;
-      }
-    }
-    return null;
-  }, [currentMessages]);
-  const assistantTimeline = useMemo(
-    () =>
-      currentMessages
-        .filter(
-          (
-            message,
-          ): message is ChatMessage & { role: "assistant"; neuralRecord: NeuralRecord } =>
-            message.role === "assistant" && Boolean(message.neuralRecord),
-        )
-        .slice()
-        .reverse(),
-    [currentMessages],
+  const selectedConversation = useMemo(
+    () => conversations.find((item) => item.id === selectedConversationId) || null,
+    [conversations, selectedConversationId],
+  );
+  const displayedMessages = useMemo(
+    () => selectedConversation?.messages || starterConversation(selectedCharacter),
+    [selectedConversation, selectedCharacter],
   );
   const activeProviderPreset = getProviderCatalogItem(providerSettings.providerMode);
-  const outboundDeploymentByChannel = useMemo<Record<DeploymentChannel, DeploymentRecord | null>>(
-    () => ({
-      webhook: deployments.find((item) => item.channel === "webhook") || null,
-      slack: deployments.find((item) => item.channel === "slack") || null,
-      telegram: deployments.find((item) => item.channel === "telegram") || null,
-    }),
-    [deployments],
+  const activeOutboundDeployment = useMemo(
+    () => deployments.find((item) => item.channel === activeOutboundChannel) || null,
+    [activeOutboundChannel, deployments],
   );
-  const activeOutboundDeployment = outboundDeploymentByChannel[activeOutboundChannel];
 
   useEffect(() => {
-    void loadCharacters();
-    void loadProviderSettings();
+    void bootstrap();
   }, []);
 
   useEffect(() => {
-    if (!selectedCharacter) {
-      setConversation(null);
+    if (!selectedCharacterId) {
+      setConversations([]);
+      setSelectedConversationId("");
       setDeployments([]);
-      setActiveOutboundChannel("webhook");
       setSlackDraft(emptySlackDraft());
       setTelegramDraft(emptyTelegramDraft());
       setWebhookDraft(emptyWebhookDraft());
       return;
     }
-    setDefinition(selectedCharacter.definition);
-    setBlueprintPreview(selectedCharacter.blueprint);
-    void loadConversation(selectedCharacter.id);
-    void loadDeployments(selectedCharacter.id);
-  }, [selectedCharacter]);
+    void loadConversations(selectedCharacterId);
+    void loadDeployments(selectedCharacterId);
+  }, [selectedCharacterId]);
 
-  async function loadCharacters() {
+  async function bootstrap() {
+    await Promise.all([loadCharacters(), loadProviderSettings()]);
+  }
+
+  async function loadCharacters(preferredCharacterId?: string) {
     const payload = await requestJson<{ characters: CharacterRecord[] }>("/api/characters");
     setCharacters(payload.characters);
-    if (!selectedCharacterId && payload.characters[0]) {
-      setSelectedCharacterId(payload.characters[0].id);
+    if (!payload.characters.length) {
+      setSelectedCharacterId("");
+      setAppSection("characters");
+      return;
     }
+
+    const candidateId = preferredCharacterId || selectedCharacterId;
+    const nextCharacter =
+      payload.characters.find((item) => item.id === candidateId) || payload.characters[0];
+    setSelectedCharacterId(nextCharacter.id);
   }
 
   async function loadProviderSettings() {
@@ -259,14 +275,30 @@ export default function App() {
     setProviderSettings(payload.provider);
   }
 
+  async function loadConversations(characterId: string) {
+    const payload = await requestJson<{ conversations: ConversationRecord[] }>(
+      `/api/conversations?characterId=${encodeURIComponent(characterId)}`,
+    );
+    const nextConversations = sortConversations(payload.conversations);
+    setConversations(nextConversations);
+    setSelectedConversationId((current) => {
+      if (nextConversations.some((item) => item.id === current)) {
+        return current;
+      }
+      return nextConversations[0]?.id || "";
+    });
+  }
+
   async function loadDeployments(characterId: string) {
     const payload = await requestJson<{ deployments: DeploymentRecord[] }>(
       `/api/deployments?characterId=${encodeURIComponent(characterId)}`,
     );
     setDeployments(payload.deployments);
+
     const slack = payload.deployments.find((item) => item.channel === "slack");
     const telegram = payload.deployments.find((item) => item.channel === "telegram");
     const webhook = payload.deployments.find((item) => item.channel === "webhook");
+
     setSlackDraft(
       slack
         ? {
@@ -301,25 +333,6 @@ export default function App() {
     );
   }
 
-  async function loadConversation(characterId: string) {
-    const payload = await requestJson<{ conversation: ConversationRecord | null }>(
-      `/api/conversations?characterId=${encodeURIComponent(characterId)}`,
-    );
-    if (payload.conversation) {
-      setConversation(payload.conversation);
-      return;
-    }
-    const character = characters.find((item) => item.id === characterId) || selectedCharacter;
-    setConversation({
-      id: "",
-      characterId,
-      title: "New neural chat",
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      messages: starterConversation(character),
-    });
-  }
-
   function patchCharacter(nextCharacter: CharacterRecord) {
     setCharacters((current) => {
       const index = current.findIndex((item) => item.id === nextCharacter.id);
@@ -332,25 +345,89 @@ export default function App() {
     });
   }
 
-  function startNewCharacter() {
-    setSelectedCharacterId("");
-    setDefinition(emptyRoleDefinition());
-    setBlueprintPreview(null);
-    setConversation(null);
-    setStudioError("");
+  function upsertConversationState(nextConversation: ConversationRecord) {
+    setConversations((current) => {
+      const index = current.findIndex((item) => item.id === nextConversation.id);
+      if (index === -1) {
+        return sortConversations([nextConversation, ...current]);
+      }
+      const copy = [...current];
+      copy[index] = nextConversation;
+      return sortConversations(copy);
+    });
+    setSelectedConversationId(nextConversation.id);
   }
 
-  function updateField<Key extends keyof RoleDefinitionInput>(
+  function prepareCreateCharacter() {
+    setStudioMode("create");
+    setCharacterBrief("");
+    setDefinition(emptyRoleDefinition());
+    setBlueprintPreview(null);
+    setShowAdvancedBuilder(false);
+    setStudioError("");
+    setStudioSaved("");
+    setAppSection("characters");
+  }
+
+  function prepareEditCharacter(character: CharacterRecord) {
+    setStudioMode("edit");
+    setSelectedCharacterId(character.id);
+    setCharacterBrief(character.definition.oneLiner);
+    setDefinition(character.definition);
+    setBlueprintPreview(character.blueprint);
+    setShowAdvancedBuilder(true);
+    setStudioError("");
+    setStudioSaved("");
+    setAppSection("characters");
+  }
+
+  function openChatForCharacter(character: CharacterRecord) {
+    setSelectedCharacterId(character.id);
+    setAppSection("chat");
+    setChatError("");
+  }
+
+  function updateDefinitionField<Key extends keyof RoleDefinitionInput>(
     key: Key,
     value: RoleDefinitionInput[Key],
   ) {
     setDefinition((current) => ({ ...current, [key]: value }));
+    setStudioSaved("");
   }
 
-  async function handleGenerateBlueprint(event: FormEvent) {
+  async function handleComposeCharacter(event: FormEvent) {
     event.preventDefault();
+    if (!characterBrief.trim()) {
+      setStudioError("Give the character a one-line concept first.");
+      return;
+    }
+
     setStudioBusy(true);
     setStudioError("");
+    setStudioSaved("");
+    try {
+      const payload = await requestJson<CharacterComposePayload>("/api/characters/compose", {
+        method: "POST",
+        body: JSON.stringify({
+          brief: characterBrief,
+          language: definition.language,
+        }),
+      });
+      setDefinition(payload.definition);
+      setBlueprintPreview(payload.blueprint);
+      setShowAdvancedBuilder(false);
+      setStudioSaved("Definition expanded and bundle preview generated.");
+    } catch (error: any) {
+      setStudioError(String(error?.message || error));
+    } finally {
+      setStudioBusy(false);
+    }
+  }
+
+  async function handleRefreshBlueprint() {
+    setStudioBusy(true);
+    setStudioError("");
+    setStudioSaved("");
     try {
       const payload = await requestJson<{ blueprint: RoleBlueprint }>(
         "/api/characters/generate",
@@ -360,6 +437,7 @@ export default function App() {
         },
       );
       setBlueprintPreview(payload.blueprint);
+      setStudioSaved("Bundle preview refreshed from the current definition.");
     } catch (error: any) {
       setStudioError(String(error?.message || error));
     } finally {
@@ -370,25 +448,62 @@ export default function App() {
   async function handleSaveCharacter() {
     setStudioBusy(true);
     setStudioError("");
+    setStudioSaved("");
     try {
       const payload = await requestJson<{ character: CharacterRecord }>(
         "/api/characters",
         {
-          method: selectedCharacter ? "PUT" : "POST",
+          method: studioMode === "edit" && selectedCharacter ? "PUT" : "POST",
           body: JSON.stringify({
-            id: selectedCharacter?.id,
+            id: studioMode === "edit" ? selectedCharacter?.id : undefined,
             definition,
-            blueprint: blueprintPreview,
           }),
         },
       );
+
       patchCharacter(payload.character);
       setSelectedCharacterId(payload.character.id);
+      setDefinition(payload.character.definition);
       setBlueprintPreview(payload.character.blueprint);
+      setStudioMode("edit");
+      setStudioSaved("Character saved.");
+
+      if (studioMode === "create") {
+        const conversationPayload = await requestJson<{ conversation: ConversationRecord }>(
+          "/api/conversations",
+          {
+            method: "POST",
+            body: JSON.stringify({ characterId: payload.character.id }),
+          },
+        );
+        setConversations([conversationPayload.conversation]);
+        setSelectedConversationId(conversationPayload.conversation.id);
+      } else {
+        await loadConversations(payload.character.id);
+      }
+
+      setAppSection("chat");
     } catch (error: any) {
       setStudioError(String(error?.message || error));
     } finally {
       setStudioBusy(false);
+    }
+  }
+
+  async function handleCreateConversation() {
+    if (!selectedCharacter) return;
+    setChatBusy(true);
+    setChatError("");
+    try {
+      const payload = await requestJson<{ conversation: ConversationRecord }>("/api/conversations", {
+        method: "POST",
+        body: JSON.stringify({ characterId: selectedCharacter.id }),
+      });
+      upsertConversationState(payload.conversation);
+    } catch (error: any) {
+      setChatError(String(error?.message || error));
+    } finally {
+      setChatBusy(false);
     }
   }
 
@@ -397,60 +512,26 @@ export default function App() {
     if (!selectedCharacter || !chatText.trim()) return;
 
     setChatBusy(true);
+    setChatError("");
     const userContent = chatText.trim();
     setChatText("");
-    setConversation((current) => {
-      const base = current || {
-        id: "",
-        characterId: selectedCharacter.id,
-        title: "New neural chat",
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        messages: starterConversation(selectedCharacter),
-      };
-      return {
-        ...base,
-        messages: [
-          ...base.messages,
-          {
-            id: `user-${Date.now()}`,
-            role: "user",
-            content: userContent,
-            createdAt: Date.now(),
-          },
-        ],
-      };
-    });
 
     try {
       const payload = await requestJson<ChatPayload>("/api/chat", {
         method: "POST",
         body: JSON.stringify({
           characterId: selectedCharacter.id,
-          conversationId: conversation?.id || undefined,
+          conversationId: selectedConversationId || undefined,
           message: userContent,
         }),
       });
       patchCharacter(payload.character);
-      setConversation(payload.conversation);
-      setBlueprintPreview(payload.character.blueprint);
+      upsertConversationState(payload.conversation);
+      if (studioMode === "edit" && payload.character.id === selectedCharacter.id) {
+        setBlueprintPreview(payload.character.blueprint);
+      }
     } catch (error: any) {
-      setConversation((current) =>
-        current
-          ? {
-              ...current,
-              messages: [
-                ...current.messages,
-                {
-                  id: `assistant-error-${Date.now()}`,
-                  role: "assistant",
-                  content: `Neural chat failed: ${String(error?.message || error)}`,
-                  createdAt: Date.now(),
-                },
-              ],
-            }
-          : current,
-      );
+      setChatError(String(error?.message || error));
     } finally {
       setChatBusy(false);
     }
@@ -489,7 +570,7 @@ export default function App() {
         },
       );
       setProviderSettings(payload.provider);
-      setSettingsSaved("Provider settings saved.");
+      setSettingsSaved("Runtime settings saved.");
     } catch (error: any) {
       setSettingsError(String(error?.message || error));
     } finally {
@@ -561,13 +642,13 @@ export default function App() {
               secretToken: telegramDraft.secretToken,
             },
           };
+
       const payload = await requestJson<{ deployment: DeploymentRecord }>("/api/deployments", {
         method: "POST",
-        body: JSON.stringify({
-          deployment,
-        }),
+        body: JSON.stringify({ deployment }),
       });
       await loadDeployments(selectedCharacter.id);
+
       if (channel === "webhook") {
         setWebhookDraft({
           id: payload.deployment.id,
@@ -592,6 +673,7 @@ export default function App() {
           enabled: payload.deployment.enabled,
         });
       }
+
       setIntegrationSaved(`${formatChannelName(channel)} outlet saved.`);
     } catch (error: any) {
       setIntegrationError(String(error?.message || error));
@@ -601,8 +683,8 @@ export default function App() {
   }
 
   async function handleSendDeploymentTest(channel: DeploymentChannel) {
-    const deployment = outboundDeploymentByChannel[channel];
-    if (!deployment?.id) {
+    const deployment = activeOutboundDeployment;
+    if (!deployment?.id || deployment.channel !== channel) {
       setIntegrationError(`Save a ${formatChannelName(channel).toLowerCase()} outlet first.`);
       return;
     }
@@ -618,7 +700,7 @@ export default function App() {
       }>(`/api/deployments/${encodeURIComponent(deployment.id)}/send-test`, {
         method: "POST",
         body: JSON.stringify({
-          conversationId: conversation?.id || undefined,
+          conversationId: selectedConversation?.id || undefined,
         }),
       });
       setIntegrationSaved(
@@ -632,13 +714,13 @@ export default function App() {
   }
 
   async function handleExportConversation(format: "json" | "markdown") {
-    if (!conversation?.id) return;
+    if (!selectedConversation?.id) return;
     setExportBusy(format);
     setIntegrationError("");
     setIntegrationSaved("");
     try {
       const response = await fetch(
-        `/api/conversations/${encodeURIComponent(conversation.id)}/export?format=${encodeURIComponent(format)}`,
+        `/api/conversations/${encodeURIComponent(selectedConversation.id)}/export?format=${encodeURIComponent(format)}`,
       );
       if (!response.ok) {
         const payload = await response.json().catch(() => null);
@@ -647,7 +729,7 @@ export default function App() {
         );
       }
 
-      const baseName = `${selectedCharacter?.slug || "liberth-neural"}-${conversation.id}`;
+      const baseName = `${selectedCharacter?.slug || "liberth-neural"}-${selectedConversation.id}`;
       if (format === "json") {
         const payload = await response.json();
         downloadText(
@@ -691,13 +773,11 @@ export default function App() {
           <span className="metric-chip">focus {formatPercent(record.modulators.focus)}</span>
           <span className="metric-chip">novelty {formatPercent(record.modulators.novelty)}</span>
           <span className="metric-chip">caution {formatPercent(record.modulators.caution)}</span>
-          <span className="metric-chip">
-            margin {formatPercent(record.routeInspector.margin)}
-          </span>
+          <span className="metric-chip">margin {formatPercent(record.routeInspector.margin)}</span>
         </div>
 
         <details className="neural-details">
-          <summary>查看神经日志</summary>
+          <summary>Inspect neural record</summary>
           <div className="neural-details-grid">
             <article className="neural-block">
               <strong>Why this route</strong>
@@ -738,34 +818,756 @@ export default function App() {
                   {record.memoryDirective.durableMemoryCandidate}
                 </pre>
               ) : (
-                <p className="small-note">本轮没有写入长期记忆候选。</p>
+                <p className="small-note">This turn did not produce a durable-memory candidate.</p>
               )}
-            </article>
-
-            <article className="neural-block">
-              <strong>Alternative routes</strong>
-              <ul>
-                {record.routeInspector.alternatives.map((item) => (
-                  <li key={item.route}>
-                    {item.route}: {formatPercent(item.weight)} / gap {formatPercent(item.gap)}
-                  </li>
-                ))}
-              </ul>
-            </article>
-
-            <article className="neural-block">
-              <strong>Top neurons</strong>
-              <div className="tag-row">
-                {record.topNeurons.map((item) => (
-                  <span key={item.neuronId} className="tag">
-                    {item.neuronId}
-                  </span>
-                ))}
-              </div>
             </article>
           </div>
         </details>
       </section>
+    );
+  }
+
+  function renderCharacterBuilder() {
+    return (
+      <>
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Character Builder</p>
+              <h2>One-line concept first</h2>
+            </div>
+            <button className="ghost-button" type="button" onClick={prepareCreateCharacter}>
+              New character
+            </button>
+          </div>
+
+          <form className="form-stack" onSubmit={handleComposeCharacter}>
+            <label>
+              <span>Concept</span>
+              <textarea
+                value={characterBrief}
+                onChange={(event) => setCharacterBrief(event.target.value)}
+                placeholder="Example: A midnight strategy editor who answers like a calm newsroom chief."
+              />
+            </label>
+
+            <div className="actions">
+              <button className="primary-button" type="submit" disabled={studioBusy}>
+                {studioBusy ? "Generating..." : "Generate details"}
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleRefreshBlueprint}
+                disabled={studioBusy || !definition.name}
+              >
+                Refresh bundle
+              </button>
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={() => setShowAdvancedBuilder((current) => !current)}
+                disabled={!definition.name}
+              >
+                {showAdvancedBuilder ? "Hide details" : "Edit details"}
+              </button>
+            </div>
+          </form>
+
+          <p className="small-note">
+            Describe the role in one sentence. AI expands the full character definition first,
+            then builds the neural bundle from that result.
+          </p>
+
+          {studioError ? <p className="error-banner">{studioError}</p> : null}
+          {studioSaved ? <p className="success-banner">{studioSaved}</p> : null}
+        </section>
+
+        <div className="character-shell">
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Expanded Definition</p>
+                <h2>{definition.name || "Waiting for a concept"}</h2>
+              </div>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleSaveCharacter}
+                disabled={studioBusy || !definition.name}
+              >
+                {studioBusy ? "Saving..." : studioMode === "edit" ? "Update character" : "Save character"}
+              </button>
+            </div>
+
+            {definition.name ? (
+              <div className="stack-list">
+                <article className="list-card">
+                  <strong>Core summary</strong>
+                  <p>{definition.oneLiner}</p>
+                </article>
+                <article className="list-card">
+                  <strong>Audience and tone</strong>
+                  <p>{definition.audience}</p>
+                  <p>{definition.tone}</p>
+                </article>
+                <article className="list-card">
+                  <strong>Goals and boundaries</strong>
+                  <p>{definition.goals}</p>
+                  <p>{definition.boundaries}</p>
+                </article>
+                {blueprintPreview?.tags?.length ? (
+                  <article className="list-card">
+                    <strong>Bundle tags</strong>
+                    <div className="tag-row">
+                      {blueprintPreview.tags.map((tag) => (
+                        <span key={tag} className="tag">
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  </article>
+                ) : null}
+              </div>
+            ) : (
+              <p className="empty-state">
+                Expand a one-line concept first. The full definition will appear here before you
+                save the character.
+              </p>
+            )}
+          </section>
+
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Bundle Preview</p>
+                <h2>{blueprintPreview?.summary || "Bundle not generated yet"}</h2>
+              </div>
+            </div>
+
+            {blueprintPreview ? (
+              <>
+                <p className="small-note">{blueprintPreview.greeting}</p>
+                <div className="tag-row">
+                  {blueprintPreview.tags.map((tag) => (
+                    <span key={tag} className="tag">
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+                {showAdvancedBuilder ? (
+                  <div className="form-stack advanced-editor">
+                    <label>
+                      <span>Language</span>
+                      <select
+                        value={definition.language}
+                        onChange={(event) => updateDefinitionField("language", event.target.value)}
+                      >
+                        <option value="English">English</option>
+                        <option value="Chinese">Chinese</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Name</span>
+                      <input
+                        value={definition.name}
+                        onChange={(event) => updateDefinitionField("name", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>One-liner</span>
+                      <input
+                        value={definition.oneLiner}
+                        onChange={(event) => updateDefinitionField("oneLiner", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Domain</span>
+                      <input
+                        value={definition.domain}
+                        onChange={(event) => updateDefinitionField("domain", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Audience</span>
+                      <input
+                        value={definition.audience}
+                        onChange={(event) => updateDefinitionField("audience", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Tone</span>
+                      <input
+                        value={definition.tone}
+                        onChange={(event) => updateDefinitionField("tone", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Greeting</span>
+                      <input
+                        value={definition.greeting}
+                        onChange={(event) => updateDefinitionField("greeting", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Personality</span>
+                      <textarea
+                        value={definition.personality}
+                        onChange={(event) =>
+                          updateDefinitionField("personality", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Goals</span>
+                      <textarea
+                        value={definition.goals}
+                        onChange={(event) => updateDefinitionField("goals", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Boundaries</span>
+                      <textarea
+                        value={definition.boundaries}
+                        onChange={(event) =>
+                          updateDefinitionField("boundaries", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Knowledge pack</span>
+                      <textarea
+                        value={definition.knowledge}
+                        onChange={(event) =>
+                          updateDefinitionField("knowledge", event.target.value)}
+                      />
+                    </label>
+                  </div>
+                ) : (
+                  <p className="small-note">
+                    Keep the builder simple. Only open the full editor if you want to fine-tune the
+                    generated definition before saving.
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="empty-state">
+                After expansion, this panel will show the generated greeting, bundle summary, and
+                tags that will drive the saved role.
+              </p>
+            )}
+          </section>
+        </div>
+      </>
+    );
+  }
+
+  function renderChatWorkspace() {
+    const memories = Array.isArray(selectedCharacter?.globalMemories)
+      ? (selectedCharacter?.globalMemories || [])
+      : [];
+
+    return (
+      <>
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Chat Workspace</p>
+              <h2>{selectedCharacter ? selectedCharacter.definition.name : "Select a character"}</h2>
+            </div>
+            <div className="actions">
+              {selectedCharacter ? (
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => prepareEditCharacter(selectedCharacter)}
+                >
+                  Edit character
+                </button>
+              ) : null}
+              <button className="ghost-button" type="button" onClick={() => setAppSection("characters")}>
+                Characters
+              </button>
+            </div>
+          </div>
+
+          {selectedCharacter ? (
+            <p className="small-note">
+              Chat lives separately from the builder now. Pick or create a role first, then keep
+              local conversation history in this workspace like a ChatGPT-style thread list.
+            </p>
+          ) : (
+            <p className="empty-state">
+              Create or choose a neural character before entering chat.
+            </p>
+          )}
+        </section>
+
+        {selectedCharacter ? (
+          <>
+            <div className="chat-shell">
+              <section className="panel conversation-sidebar">
+                <div className="panel-header">
+                  <div>
+                    <p className="eyebrow">Conversations</p>
+                    <h2>Local history</h2>
+                  </div>
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={handleCreateConversation}
+                    disabled={chatBusy}
+                  >
+                    New chat
+                  </button>
+                </div>
+
+                <div className="conversation-list">
+                  {conversations.length ? (
+                    conversations.map((conversation) => (
+                      <button
+                        key={conversation.id}
+                        className={`conversation-item ${
+                          conversation.id === selectedConversationId ? "active" : ""
+                        }`}
+                        type="button"
+                        onClick={() => setSelectedConversationId(conversation.id)}
+                      >
+                        <strong>{conversation.title || "New chat"}</strong>
+                        <span>{conversationSnippet(conversation)}</span>
+                        <small>{formatTime(conversation.updatedAt)}</small>
+                      </button>
+                    ))
+                  ) : (
+                    <p className="empty-state">
+                      No saved conversations yet. Send a message or create a new chat.
+                    </p>
+                  )}
+                </div>
+              </section>
+
+              <section className="panel chat-panel">
+                <div className="panel-header">
+                  <div>
+                    <p className="eyebrow">Thread</p>
+                    <h2>{selectedConversation?.title || "New chat"}</h2>
+                  </div>
+                  <div className="actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => handleExportConversation("json")}
+                      disabled={!selectedConversation?.id || exportBusy !== ""}
+                    >
+                      {exportBusy === "json" ? "Exporting..." : "Export JSON"}
+                    </button>
+                    <button
+                      className="ghost-button"
+                      type="button"
+                      onClick={() => handleExportConversation("markdown")}
+                      disabled={!selectedConversation?.id || exportBusy !== ""}
+                    >
+                      {exportBusy === "markdown" ? "Exporting..." : "Export Markdown"}
+                    </button>
+                  </div>
+                </div>
+
+                {chatError ? <p className="error-banner">{chatError}</p> : null}
+
+                <div className="message-stage">
+                  {displayedMessages.map((message) => (
+                    <article
+                      key={`${selectedConversation?.id || "starter"}-${message.id}`}
+                      className={`message-card ${message.role}`}
+                    >
+                      <div className="message-meta">
+                        <span className="message-role">{message.role}</span>
+                        <span className="message-time">{formatTime(message.createdAt)}</span>
+                      </div>
+                      <div className="message-copy">
+                        <p>{message.content}</p>
+                      </div>
+                      {message.role === "assistant" && message.neuralRecord
+                        ? renderNeuralRecord(message.neuralRecord)
+                        : null}
+                    </article>
+                  ))}
+                </div>
+
+                <form className="composer" onSubmit={handleSendMessage}>
+                  <textarea
+                    value={chatText}
+                    onChange={(event) => setChatText(event.target.value)}
+                    placeholder={
+                      selectedConversation
+                        ? "Message the character..."
+                        : "Send a message to start a new local conversation."
+                    }
+                    disabled={chatBusy}
+                  />
+                  <div className="actions">
+                    <button className="primary-button" type="submit" disabled={chatBusy}>
+                      {chatBusy ? "Sending..." : "Send"}
+                    </button>
+                  </div>
+                </form>
+              </section>
+            </div>
+
+            <div className="split chat-meta-grid">
+              <section className="panel">
+                <div className="panel-header">
+                  <div>
+                    <p className="eyebrow">Character</p>
+                    <h2>Active role snapshot</h2>
+                  </div>
+                </div>
+                <div className="stack-list">
+                  <article className="list-card">
+                    <strong>{selectedCharacter.definition.name}</strong>
+                    <p>{selectedCharacter.definition.oneLiner}</p>
+                  </article>
+                  <article className="list-card">
+                    <strong>Bundle summary</strong>
+                    <p>{selectedCharacter.blueprint.summary}</p>
+                  </article>
+                  <article className="list-card">
+                    <strong>Tags</strong>
+                    <div className="tag-row">
+                      {selectedCharacter.blueprint.tags.map((tag) => (
+                        <span key={tag} className="tag">
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  </article>
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-header">
+                  <div>
+                    <p className="eyebrow">Durable Memory</p>
+                    <h2>Local memory store</h2>
+                  </div>
+                </div>
+                {memories.length ? (
+                  <div className="stack-list">
+                    {[...memories].reverse().map((memory: NeuralMemoryRecord) => (
+                      <article key={memory.id} className="list-card">
+                        <strong>{memory.sourceRoute || "memory"}</strong>
+                        <p>{memory.content}</p>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="empty-state">
+                    Stable preferences and repeated signals will accumulate here over time.
+                  </p>
+                )}
+              </section>
+            </div>
+          </>
+        ) : null}
+      </>
+    );
+  }
+
+  function renderOutboundSettings() {
+    if (!selectedCharacter) {
+      return <p className="empty-state">Select a character to configure outbound channels.</p>;
+    }
+
+    const currentDraft = activeOutboundChannel === "webhook"
+      ? webhookDraft
+      : activeOutboundChannel === "slack"
+      ? slackDraft
+      : telegramDraft;
+
+    return (
+      <div className="stack-list">
+        <div className="provider-grid">
+          {(["webhook", "slack", "telegram"] as DeploymentChannel[]).map((channel) => (
+            <button
+              key={channel}
+              className={`provider-card ${activeOutboundChannel === channel ? "active" : ""}`}
+              type="button"
+              onClick={() => setActiveOutboundChannel(channel)}
+            >
+              <strong>{formatChannelName(channel)}</strong>
+              <span>{describeChannel(channel)}</span>
+              {deployments.find((item) => item.channel === channel) ? (
+                <span className="small-note">
+                  {describeDeploymentTarget(
+                    deployments.find((item) => item.channel === channel) as DeploymentRecord,
+                  )}
+                </span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+
+        <div className="form-stack">
+          {activeOutboundChannel === "webhook" ? (
+            <>
+              <label>
+                <span>Outbound URL</span>
+                <input
+                  value={webhookDraft.outboundUrl}
+                  onChange={(event) => updateWebhookDraft("outboundUrl", event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Authorization header</span>
+                <input
+                  value={webhookDraft.outboundAuthHeader}
+                  onChange={(event) =>
+                    updateWebhookDraft("outboundAuthHeader", event.target.value)}
+                />
+              </label>
+            </>
+          ) : null}
+
+          {activeOutboundChannel === "slack" ? (
+            <>
+              <label>
+                <span>Bot token</span>
+                <input
+                  type="password"
+                  value={slackDraft.botToken}
+                  onChange={(event) => updateSlackDraft("botToken", event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Channel ID</span>
+                <input
+                  value={slackDraft.channelId}
+                  onChange={(event) => updateSlackDraft("channelId", event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Signing secret</span>
+                <input
+                  type="password"
+                  value={slackDraft.signingSecret}
+                  onChange={(event) => updateSlackDraft("signingSecret", event.target.value)}
+                />
+              </label>
+            </>
+          ) : null}
+
+          {activeOutboundChannel === "telegram" ? (
+            <>
+              <label>
+                <span>Bot token</span>
+                <input
+                  type="password"
+                  value={telegramDraft.botToken}
+                  onChange={(event) => updateTelegramDraft("botToken", event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Chat ID</span>
+                <input
+                  value={telegramDraft.chatId}
+                  onChange={(event) => updateTelegramDraft("chatId", event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Secret token</span>
+                <input
+                  type="password"
+                  value={telegramDraft.secretToken}
+                  onChange={(event) => updateTelegramDraft("secretToken", event.target.value)}
+                />
+              </label>
+            </>
+          ) : null}
+
+          <label>
+            <span>Status</span>
+            <select
+              value={currentDraft.enabled ? "enabled" : "disabled"}
+              onChange={(event) => {
+                const enabled = event.target.value === "enabled";
+                if (activeOutboundChannel === "webhook") {
+                  updateWebhookDraft("enabled", enabled);
+                } else if (activeOutboundChannel === "slack") {
+                  updateSlackDraft("enabled", enabled);
+                } else {
+                  updateTelegramDraft("enabled", enabled);
+                }
+              }}
+            >
+              <option value="enabled">Enabled</option>
+              <option value="disabled">Disabled</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="actions">
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => handleSaveDeployment(activeOutboundChannel)}
+            disabled={integrationBusy}
+          >
+            {integrationBusy ? "Saving..." : `Save ${formatChannelName(activeOutboundChannel)}`}
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => handleSendDeploymentTest(activeOutboundChannel)}
+            disabled={integrationBusy || !activeOutboundDeployment}
+          >
+            Send test
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  function renderSettingsWorkspace() {
+    return (
+      <>
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Settings</p>
+              <h2>Runtime and advanced controls</h2>
+            </div>
+          </div>
+          <p className="small-note">
+            Runtime configuration lives here now, separate from role creation and chat. API keys
+            remain write-only.
+          </p>
+        </section>
+
+        <div className="split settings-grid">
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Runtime</p>
+                <h2>Provider settings</h2>
+              </div>
+            </div>
+
+            <div className="settings-runtime-shell">
+              <aside className="settings-provider-nav">
+                {providerCatalog.map((item) => (
+                  <button
+                    key={item.id}
+                    className={`settings-provider-button ${
+                      providerSettings.providerMode === item.id ? "active" : ""
+                    }`}
+                    type="button"
+                    onClick={() => updateProviderMode(item.id)}
+                  >
+                    <strong>{item.label}</strong>
+                    <span>{item.description}</span>
+                  </button>
+                ))}
+              </aside>
+
+              <div className="settings-provider-form">
+                <div className="settings-provider-summary">
+                  <p className="eyebrow">Selected provider</p>
+                  <h3>{activeProviderPreset.label}</h3>
+                  <p className="small-note">{activeProviderPreset.description}</p>
+                </div>
+
+                <div className="form-stack">
+                  {providerSettings.providerMode !== "ollama" ? (
+                    <label>
+                      <span>API key</span>
+                      <input
+                        type="password"
+                        placeholder={activeProviderPreset.apiKeyPlaceholder}
+                        value={providerSettings.apiKey}
+                        onChange={(event) => updateProviderField("apiKey", event.target.value)}
+                      />
+                    </label>
+                  ) : null}
+
+                  {providerSettings.providerMode === "glm-main" ? (
+                    <label>
+                      <span>GLM model</span>
+                      <input
+                        value={providerSettings.glmModel}
+                        onChange={(event) => updateProviderField("glmModel", event.target.value)}
+                      />
+                    </label>
+                  ) : (
+                    <>
+                      <label>
+                        <span>Base URL</span>
+                        <input
+                          value={providerSettings.baseUrl}
+                          onChange={(event) => updateProviderField("baseUrl", event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        <span>Model</span>
+                        <input
+                          value={providerSettings.model}
+                          onChange={(event) => updateProviderField("model", event.target.value)}
+                        />
+                      </label>
+                      {providerSettings.providerMode === "anthropic" ? (
+                        <label>
+                          <span>Anthropic version</span>
+                          <input
+                            value={providerSettings.anthropicVersion}
+                            onChange={(event) =>
+                              updateProviderField("anthropicVersion", event.target.value)}
+                          />
+                        </label>
+                      ) : null}
+                      {providerSettings.providerMode === "google-gemini" ? (
+                        <label>
+                          <span>Google API version</span>
+                          <input
+                            value={providerSettings.googleApiVersion}
+                            onChange={(event) =>
+                              updateProviderField("googleApiVersion", event.target.value)}
+                          />
+                        </label>
+                      ) : null}
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="actions">
+              <button
+                className="primary-button wide"
+                type="button"
+                onClick={handleSaveProviderSettings}
+                disabled={settingsBusy}
+              >
+                {settingsBusy ? "Saving..." : "Save runtime"}
+              </button>
+            </div>
+
+            <p className="small-note">
+              Leave the API key blank to keep the stored key for the current provider.
+            </p>
+            {settingsError ? <p className="error-banner">{settingsError}</p> : null}
+            {settingsSaved ? <p className="success-banner">{settingsSaved}</p> : null}
+          </section>
+
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Outbound</p>
+                <h2>Character-specific channels</h2>
+              </div>
+            </div>
+            {renderOutboundSettings()}
+            {integrationError ? <p className="error-banner">{integrationError}</p> : null}
+            {integrationSaved ? <p className="success-banner">{integrationSaved}</p> : null}
+          </section>
+        </div>
+      </>
     );
   }
 
@@ -776,908 +1578,143 @@ export default function App() {
           <p className="eyebrow">liberth-neural</p>
           <h1>Neural character dialogue</h1>
           <p className="muted">
-            独立的神经元角色工作台。角色由 blueprint、neural graph、长期记忆和每轮
-            neural log 共同驱动。
+            Generate or select a role first, then chat in a separate workspace with local
+            conversation history.
           </p>
         </div>
 
         <section className="panel">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Provider</p>
-              <h2>Runtime API matrix</h2>
+              <p className="eyebrow">Navigation</p>
+              <h2>Workspace</h2>
             </div>
           </div>
-
-          <div className="provider-grid">
-            {providerCatalog.map((item) => (
-              <button
-                key={item.id}
-                className={`provider-card ${
-                  providerSettings.providerMode === item.id ? "active" : ""
-                }`}
-                type="button"
-                onClick={() => updateProviderMode(item.id)}
-              >
-                <strong>{item.label}</strong>
-                <span>{item.description}</span>
-              </button>
-            ))}
-          </div>
-
-          <div className="form-stack">
-            <label>
-              <span>Mode</span>
-              <select
-                value={providerSettings.providerMode}
-                onChange={(event) => updateProviderMode(event.target.value as ProviderMode)}
-              >
-                {providerCatalog.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            {providerSettings.providerMode === "glm-main" ? (
-              <label>
-                <span>GLM model</span>
-                <input
-                  value={providerSettings.glmModel}
-                  onChange={(event) => updateProviderField("glmModel", event.target.value)}
-                />
-              </label>
-            ) : (
-              <>
-                <label>
-                  <span>API key</span>
-                  <input
-                    type="password"
-                    placeholder={activeProviderPreset.apiKeyPlaceholder}
-                    value={providerSettings.apiKey}
-                    onChange={(event) => updateProviderField("apiKey", event.target.value)}
-                  />
-                </label>
-                <label>
-                  <span>Base URL</span>
-                  <input
-                    value={providerSettings.baseUrl}
-                    onChange={(event) => updateProviderField("baseUrl", event.target.value)}
-                  />
-                </label>
-                <label>
-                  <span>Model</span>
-                  <input
-                    value={providerSettings.model}
-                    onChange={(event) => updateProviderField("model", event.target.value)}
-                  />
-                </label>
-                {providerSettings.providerMode === "anthropic" ? (
-                  <label>
-                    <span>Anthropic version</span>
-                    <input
-                      value={providerSettings.anthropicVersion}
-                      onChange={(event) =>
-                        updateProviderField("anthropicVersion", event.target.value)}
-                    />
-                  </label>
-                ) : null}
-                {providerSettings.providerMode === "google-gemini" ? (
-                  <label>
-                    <span>Google API version</span>
-                    <input
-                      value={providerSettings.googleApiVersion}
-                      onChange={(event) =>
-                        updateProviderField("googleApiVersion", event.target.value)}
-                    />
-                  </label>
-                ) : null}
-              </>
-            )}
-          </div>
-
-          <div className="actions">
+          <div className="nav-stack">
             <button
-              className="primary-button wide"
+              className={`nav-button ${appSection === "characters" ? "active" : ""}`}
               type="button"
-              onClick={handleSaveProviderSettings}
-              disabled={settingsBusy}
+              onClick={() => setAppSection("characters")}
             >
-              {settingsBusy ? "Saving..." : "Save runtime"}
+              Characters
+            </button>
+            <button
+              className={`nav-button ${appSection === "chat" ? "active" : ""}`}
+              type="button"
+              onClick={() => setAppSection("chat")}
+              disabled={!selectedCharacter}
+            >
+              Chat
+            </button>
+            <button
+              className={`nav-button ${appSection === "settings" ? "active" : ""}`}
+              type="button"
+              onClick={() => setAppSection("settings")}
+            >
+              Settings
             </button>
           </div>
-          <p className="small-note">
-            当前预设支持 GLM、OpenAI Compatible、OpenRouter、DeepSeek、SiliconFlow、
-            Groq、Ollama、Anthropic、Google Gemini。
-          </p>
-          {settingsError ? <p className="error-banner">{settingsError}</p> : null}
-          {settingsSaved ? <p className="success-banner">{settingsSaved}</p> : null}
         </section>
 
         <section className="panel">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Characters</p>
-              <h2>Neural roster</h2>
+              <p className="eyebrow">Selected role</p>
+              <h2>{selectedCharacter?.definition.name || "None yet"}</h2>
             </div>
-            <button className="ghost-button" type="button" onClick={startNewCharacter}>
+            {selectedCharacter ? (
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={() => prepareEditCharacter(selectedCharacter)}
+              >
+                Edit
+              </button>
+            ) : null}
+          </div>
+
+          {selectedCharacter ? (
+            <div className="stack-list">
+              <article className="list-card">
+                <strong>{selectedCharacter.definition.oneLiner}</strong>
+                <p>{selectedCharacter.blueprint.summary}</p>
+              </article>
+              <div className="tag-row">
+                {selectedCharacter.blueprint.tags.slice(0, 6).map((tag) => (
+                  <span key={tag} className="tag">
+                    {tag}
+                  </span>
+                ))}
+              </div>
+              <div className="actions">
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => openChatForCharacter(selectedCharacter)}
+                >
+                  Open chat
+                </button>
+                <button className="secondary-button" type="button" onClick={prepareCreateCharacter}>
+                  New role
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="empty-state">
+              Start with a one-line concept or select one of your saved characters below.
+            </p>
+          )}
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Saved characters</p>
+              <h2>Roster</h2>
+            </div>
+            <button className="ghost-button" type="button" onClick={prepareCreateCharacter}>
               New
             </button>
           </div>
 
           <div className="character-list">
-            {characters.length === 0 ? (
-              <p className="empty-state">还没有角色。先在右侧工作台生成一个 neural character。</p>
-            ) : null}
-
-            {characters.map((character) => (
-              <button
-                key={character.id}
-                className={`character-card ${
-                  character.id === selectedCharacterId ? "active" : ""
-                }`}
-                type="button"
-                onClick={() => setSelectedCharacterId(character.id)}
-              >
-                <strong>{character.definition.name}</strong>
-                <span>{character.definition.oneLiner}</span>
-                <div className="tag-row">
-                  {(character.blueprint.tags || []).slice(0, 4).map((tag) => (
-                    <span key={tag} className="tag">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
-              </button>
-            ))}
+            {characters.length ? (
+              characters.map((character) => (
+                <article
+                  key={character.id}
+                  className={`character-card ${character.id === selectedCharacterId ? "active" : ""}`}
+                >
+                  <strong>{character.definition.name}</strong>
+                  <span>{character.definition.oneLiner}</span>
+                  <div className="actions">
+                    <button
+                      className="primary-button"
+                      type="button"
+                      onClick={() => openChatForCharacter(character)}
+                    >
+                      Chat
+                    </button>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => prepareEditCharacter(character)}
+                    >
+                      Edit
+                    </button>
+                  </div>
+                </article>
+              ))
+            ) : (
+              <p className="empty-state">No characters saved yet.</p>
+            )}
           </div>
         </section>
-
-        <div className="legal-notice">
-          <p>
-            现在每条 assistant 回复都会附带 turn-level neural record，而不只是更新
-            右侧的全局最新状态。
-          </p>
-        </div>
       </aside>
 
       <main className="workspace">
-        <section className="panel hero-panel">
-          <div className="hero-copy">
-            <p className="eyebrow">Conversation cockpit</p>
-            <h2>{selectedCharacter?.definition.name || "Neural character studio"}</h2>
-            <p className="muted">
-              {selectedCharacter?.definition.oneLiner ||
-                "从角色定义生成 blueprint、神经图谱、系统提示词和带日志的对话回放。"}
-            </p>
-          </div>
-
-          <div className="hero-metrics">
-            <article className="hero-metric">
-              <span>Provider</span>
-              <strong>{activeProviderPreset.label}</strong>
-              <p>{providerSettings.providerMode === "glm-main" ? providerSettings.glmModel : providerSettings.model || activeProviderPreset.defaultModel}</p>
-            </article>
-            <article className="hero-metric">
-              <span>Dominant route</span>
-              <strong>{latestAssistantRecord?.dominantRoute || selectedCharacter?.lastNeuralState?.dominantRoute || "waiting"}</strong>
-              <p>{latestAssistantRecord?.broadcastSummary || selectedCharacter?.lastNeuralState?.summary || "发送第一条消息后开始激活。"}</p>
-            </article>
-            <article className="hero-metric">
-              <span>Memory mode</span>
-              <strong>
-                {latestAssistantRecord?.memoryDirective.writeGlobalMemory ? "writeback" : "thread"}
-              </strong>
-              <p>
-                {latestAssistantRecord?.memoryDirective.reason ||
-                  "稳定偏好和高强度线索才会进入长期记忆。"}
-              </p>
-            </article>
-          </div>
-        </section>
-
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Studio</p>
-              <h2>Neural character builder</h2>
-            </div>
-            {displayedBlueprint?.generation ? (
-              <span className="tag">
-                {displayedBlueprint.generation.mode} / {displayedBlueprint.generation.model}
-              </span>
-            ) : null}
-          </div>
-
-          <form className="studio-grid" onSubmit={handleGenerateBlueprint}>
-            <label>
-              <span>Name</span>
-              <input
-                value={definition.name}
-                onChange={(event) => updateField("name", event.target.value)}
-                placeholder="例如：午夜策略师 / Archive Oracle"
-              />
-            </label>
-            <label>
-              <span>One-liner</span>
-              <input
-                value={definition.oneLiner}
-                onChange={(event) => updateField("oneLiner", event.target.value)}
-                placeholder="一句话角色定位"
-              />
-            </label>
-            <label>
-              <span>Domain</span>
-              <input
-                value={definition.domain}
-                onChange={(event) => updateField("domain", event.target.value)}
-                placeholder="领域、场景、长期主题"
-              />
-            </label>
-            <label>
-              <span>Audience</span>
-              <input
-                value={definition.audience}
-                onChange={(event) => updateField("audience", event.target.value)}
-                placeholder="这个角色主要为谁服务"
-              />
-            </label>
-            <label>
-              <span>Tone</span>
-              <input
-                value={definition.tone}
-                onChange={(event) => updateField("tone", event.target.value)}
-                placeholder="例如：冷静、锋利、像总编辑"
-              />
-            </label>
-            <label>
-              <span>Language</span>
-              <select
-                value={definition.language}
-                onChange={(event) => updateField("language", event.target.value)}
-              >
-                <option value="Chinese">Chinese</option>
-                <option value="English">English</option>
-              </select>
-            </label>
-            <label className="full">
-              <span>Personality</span>
-              <textarea
-                value={definition.personality}
-                onChange={(event) => updateField("personality", event.target.value)}
-                placeholder="把角色的语气、判断方式、脾气、节奏写清楚。"
-              />
-            </label>
-            <label className="full">
-              <span>Goals</span>
-              <textarea
-                value={definition.goals}
-                onChange={(event) => updateField("goals", event.target.value)}
-                placeholder="角色的核心目标、承诺、价值观。"
-              />
-            </label>
-            <label className="full">
-              <span>Boundaries</span>
-              <textarea
-                value={definition.boundaries}
-                onChange={(event) => updateField("boundaries", event.target.value)}
-                placeholder="明确禁区、不能做什么、什么时候必须谨慎。"
-              />
-            </label>
-            <label className="full">
-              <span>Knowledge</span>
-              <textarea
-                value={definition.knowledge}
-                onChange={(event) => updateField("knowledge", event.target.value)}
-                placeholder="补充知识包、背景事实、口头禅、上下文素材。"
-              />
-            </label>
-            <label className="full">
-              <span>Greeting</span>
-              <textarea
-                value={definition.greeting}
-                onChange={(event) => updateField("greeting", event.target.value)}
-                placeholder="首条开场白。留空则由 neural blueprint 自动生成。"
-              />
-            </label>
-            <div className="full actions">
-              <button className="secondary-button" type="submit" disabled={studioBusy}>
-                {studioBusy ? "Generating..." : "Generate blueprint"}
-              </button>
-              <button
-                className="primary-button"
-                type="button"
-                onClick={handleSaveCharacter}
-                disabled={studioBusy}
-              >
-                {studioBusy ? "Saving..." : selectedCharacter ? "Update character" : "Save character"}
-              </button>
-            </div>
-          </form>
-
-          {studioError ? <p className="error-banner">{studioError}</p> : null}
-        </section>
-
-        <section className="preview-grid">
-          <article className="preview-card">
-            <p className="eyebrow">Identity</p>
-            <h3>{displayedBlueprint?.profile?.identity.publicIntro || "等待生成角色"}</h3>
-            <p>
-              {displayedBlueprint?.summary ||
-                "生成后这里会显示角色摘要、人格连续性与核心定位。"}
-            </p>
-            <div className="tag-row">
-              {(displayedBlueprint?.profile?.identity.signatureTraits || []).slice(0, 6).map((item) => (
-                <span key={item} className="tag">
-                  {item}
-                </span>
-              ))}
-            </div>
-          </article>
-
-          <article className="preview-card">
-            <p className="eyebrow">Neural graph</p>
-            {displayedBlueprint?.neuralGraph ? (
-              <>
-                <ul>
-                  <li>actor: {displayedBlueprint.neuralGraph.manifest.actorType}</li>
-                  <li>regions: {displayedBlueprint.neuralGraph.regions.length}</li>
-                  <li>neurons: {displayedBlueprint.neuralGraph.neurons.length}</li>
-                  <li>synapses: {displayedBlueprint.neuralGraph.synapses.length}</li>
-                  <li>circuits: {displayedBlueprint.neuralGraph.circuits.length}</li>
-                </ul>
-                <div className="tag-row">
-                  {displayedBlueprint.neuralGraph.circuits.slice(0, 5).map((circuit) => (
-                    <span key={circuit.id} className="tag">
-                      {circuit.route}
-                    </span>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <p>生成后这里会显示 clone 风格 neural topology。</p>
-            )}
-          </article>
-
-          <article className="preview-card">
-            <p className="eyebrow">Starter prompts</p>
-            {displayedBlueprint?.starterQuestions?.length ? (
-              <ul>
-                {displayedBlueprint.starterQuestions.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-            ) : (
-              <p>生成 blueprint 后，这里会出现可直接喂给角色的第一批刺激问题。</p>
-            )}
-          </article>
-        </section>
-
-        <section className="conversation-grid">
-          <div className="panel chat-panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Chat</p>
-                <h2>Neural conversation</h2>
-              </div>
-              {selectedCharacter ? <span className="tag">{selectedCharacter.definition.name}</span> : null}
-            </div>
-
-            <div className="message-list message-stage">
-              {currentMessages.map((message) => (
-                <article key={message.id} className={`message-card ${message.role}`}>
-                  <header className="message-meta">
-                    <span className="message-role">{message.role}</span>
-                    <span className="message-time">{formatTime(message.createdAt)}</span>
-                  </header>
-                  <div className="message-copy">
-                    <p>{message.content}</p>
-                  </div>
-                  {message.role === "assistant" && message.neuralRecord
-                    ? renderNeuralRecord(message.neuralRecord)
-                    : null}
-                </article>
-              ))}
-              {!selectedCharacter ? (
-                <p className="empty-state">先保存一个角色，聊天区才会开始接收神经元刺激。</p>
-              ) : null}
-            </div>
-
-            <form className="composer" onSubmit={handleSendMessage}>
-              <textarea
-                value={chatText}
-                onChange={(event) => setChatText(event.target.value)}
-                placeholder="向角色发送一条消息，观察每轮 neural route、memory writeback 和神经日志。"
-              />
-              <div className="actions">
-                <button
-                  className="primary-button"
-                  type="submit"
-                  disabled={!selectedCharacter || chatBusy}
-                >
-                  {chatBusy ? "Thinking..." : "Send stimulus"}
-                </button>
-              </div>
-            </form>
-          </div>
-
-          <div className="panel telemetry-panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Turn cockpit</p>
-                <h2>Latest neural state</h2>
-              </div>
-            </div>
-
-            {selectedCharacter?.lastNeuralState ? (
-              <div className="stack-list">
-                <article className="list-card">
-                  <strong>Dominant route</strong>
-                  <div className="tag-row">
-                    <span className={routePillClass(selectedCharacter.lastNeuralState.dominantRoute)}>
-                      {selectedCharacter.lastNeuralState.dominantRoute}
-                    </span>
-                    <span className="metric-chip">
-                      margin {formatPercent(selectedCharacter.lastNeuralState.routeInspector.margin)}
-                    </span>
-                  </div>
-                  <p>{selectedCharacter.lastNeuralState.broadcastSummary}</p>
-                </article>
-
-                <article className="list-card">
-                  <strong>Modulators</strong>
-                  <div className="tag-row">
-                    <span className="metric-chip">
-                      focus {formatPercent(selectedCharacter.lastNeuralState.modulators.focus)}
-                    </span>
-                    <span className="metric-chip">
-                      novelty {formatPercent(selectedCharacter.lastNeuralState.modulators.novelty)}
-                    </span>
-                    <span className="metric-chip">
-                      sociality {formatPercent(selectedCharacter.lastNeuralState.modulators.sociality)}
-                    </span>
-                    <span className="metric-chip">
-                      caution {formatPercent(selectedCharacter.lastNeuralState.modulators.caution)}
-                    </span>
-                    <span className="metric-chip">
-                      confidence {formatPercent(selectedCharacter.lastNeuralState.modulators.confidence)}
-                    </span>
-                  </div>
-                </article>
-
-                <article className="list-card">
-                  <strong>Route inspector</strong>
-                  <ul>
-                    {selectedCharacter.lastNeuralState.routeInspector.because.map((item) => (
-                      <li key={item}>{item}</li>
-                    ))}
-                  </ul>
-                </article>
-
-                <article className="list-card">
-                  <strong>Workspace contents</strong>
-                  <div className="tag-row">
-                    {selectedCharacter.lastNeuralState.workspaceContents.map((item) => (
-                      <span key={item.id} className="tag">
-                        {item.label}
-                      </span>
-                    ))}
-                  </div>
-                </article>
-
-                {latestAssistantRecord?.memoryDirective.durableMemoryCandidate ? (
-                  <article className="list-card">
-                    <strong>Durable candidate</strong>
-                    <pre className="mono compact-pre">
-                      {latestAssistantRecord.memoryDirective.durableMemoryCandidate}
-                    </pre>
-                  </article>
-                ) : null}
-              </div>
-            ) : (
-              <p className="empty-state">还没有运行时 neural state。发送第一条消息后这里会开始变化。</p>
-            )}
-          </div>
-        </section>
-
-        <section className="panel timeline-panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Timeline</p>
-              <h2>Neural log timeline</h2>
-            </div>
-            <span className="tag">{assistantTimeline.length} turns</span>
-          </div>
-
-          {assistantTimeline.length ? (
-            <div className="timeline-list">
-              {assistantTimeline.map((message) => (
-                <article key={message.id} className="timeline-item">
-                  <div className="timeline-rail">
-                    <span className="timeline-dot" />
-                  </div>
-
-                  <div className="timeline-card">
-                    <header className="timeline-head">
-                      <div className="timeline-title">
-                        <span className={routePillClass(message.neuralRecord.dominantRoute)}>
-                          {message.neuralRecord.dominantRoute}
-                        </span>
-                        <span className="timeline-stamp">{formatTime(message.createdAt)}</span>
-                        <span className="meta-pill">{message.neuralRecord.provider.providerMode}</span>
-                        <span className="meta-pill">{message.neuralRecord.provider.model}</span>
-                      </div>
-                      <span
-                        className={`meta-pill ${
-                          message.neuralRecord.memoryDirective.writeGlobalMemory
-                            ? "meta-pill-hot"
-                            : ""
-                        }`}
-                      >
-                        {message.neuralRecord.memoryDirective.writeGlobalMemory
-                          ? "writeback"
-                          : "thread"}
-                      </span>
-                    </header>
-
-                    <p className="timeline-summary">
-                      {message.neuralRecord.broadcastSummary || message.neuralRecord.turnSummary}
-                    </p>
-
-                    <div className="timeline-columns">
-                      <article className="timeline-block">
-                        <strong>Why</strong>
-                        <ul>
-                          {message.neuralRecord.routeInspector.because.map((item) => (
-                            <li key={item}>{item}</li>
-                          ))}
-                        </ul>
-                      </article>
-
-                      <article className="timeline-block">
-                        <strong>Workspace</strong>
-                        <div className="tag-row">
-                          {message.neuralRecord.workspaceContents.map((item) => (
-                            <span key={item.id} className="tag">
-                              {item.label}
-                            </span>
-                          ))}
-                        </div>
-                      </article>
-
-                      <article className="timeline-block">
-                        <strong>Top neurons</strong>
-                        <div className="tag-row">
-                          {message.neuralRecord.topNeurons.map((item) => (
-                            <span key={item.neuronId} className="tag">
-                              {item.neuronId}
-                            </span>
-                          ))}
-                        </div>
-                      </article>
-
-                      <article className="timeline-block">
-                        <strong>Reply excerpt</strong>
-                        <p>{message.content}</p>
-                      </article>
-                    </div>
-                  </div>
-                </article>
-              ))}
-            </div>
-          ) : (
-            <p className="empty-state">还没有 assistant neural turn。开始对话后这里会累积时间线日志。</p>
-          )}
-        </section>
-
-        <section className="split">
-          <div className="panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Memory</p>
-                <h2>Durable neural memory</h2>
-              </div>
-            </div>
-            {selectedCharacter?.globalMemories?.length ? (
-              <div className="stack-list">
-                {selectedCharacter.globalMemories.map((memory) => (
-                  <article key={memory.id} className="list-card">
-                    <strong>{memory.sourceRoute || "global"}</strong>
-                    <p>{memory.content}</p>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <p className="empty-state">还没有写入长期记忆。只有稳定偏好或重复信号才会进入这里。</p>
-            )}
-          </div>
-
-          <div className="panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Bundle</p>
-                <h2>Clone-style prompt bundle</h2>
-              </div>
-            </div>
-            {displayedBlueprint ? (
-              <div className="stack-list">
-                <article className="list-card">
-                  <strong>Files</strong>
-                  <div className="tag-row">
-                    {Object.keys(displayedBlueprint.bundleFiles || {}).slice(0, 12).map((file) => (
-                      <span key={file} className="tag">
-                        {file}
-                      </span>
-                    ))}
-                  </div>
-                </article>
-                <article className="list-card">
-                  <strong>NEURAL.md</strong>
-                  <pre className="mono compact-pre">{displayedBlueprint.neuralDoc || "No neural doc."}</pre>
-                </article>
-              </div>
-            ) : (
-              <p className="empty-state">生成 blueprint 后，这里会展示编译出的 prompt bundle 与神经元语料。</p>
-            )}
-          </div>
-        </section>
-
-        <section className="split integration-grid">
-          <div className="panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Outbound</p>
-                <h2>Outbound routes</h2>
-              </div>
-              <span className="tag">{deployments.length} configured</span>
-            </div>
-
-            {selectedCharacter ? (
-              <>
-                <div className="provider-grid">
-                  {(["webhook", "slack", "telegram"] as DeploymentChannel[]).map((channel) => {
-                    const deployment = outboundDeploymentByChannel[channel];
-                    return (
-                      <button
-                        key={channel}
-                        type="button"
-                        className={`provider-card ${activeOutboundChannel === channel ? "active" : ""}`}
-                        onClick={() => setActiveOutboundChannel(channel)}
-                      >
-                        <strong>{formatChannelName(channel)}</strong>
-                        <span>{describeChannel(channel)}</span>
-                        <span>{deployment ? describeDeploymentTarget(deployment) : "Not configured"}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <p className="small-note">
-                  {activeOutboundChannel === "webhook"
-                    ? "Webhook sends the full JSON payload for the current conversation state."
-                    : activeOutboundChannel === "slack"
-                    ? "Slack sends a compact neural summary by using chat.postMessage."
-                    : "Telegram sends a compact neural summary by using Bot API sendMessage."}
-                </p>
-
-                <div className="form-stack">
-                  {activeOutboundChannel === "webhook" ? (
-                    <>
-                      <label>
-                        <span>Outbound URL</span>
-                        <input
-                          value={webhookDraft.outboundUrl}
-                          onChange={(event) =>
-                            updateWebhookDraft("outboundUrl", event.target.value)}
-                          placeholder="https://example.com/liberth-neural-webhook"
-                        />
-                      </label>
-                      <label>
-                        <span>Authorization header</span>
-                        <input
-                          type="password"
-                          value={webhookDraft.outboundAuthHeader}
-                          onChange={(event) =>
-                            updateWebhookDraft("outboundAuthHeader", event.target.value)}
-                          placeholder="Bearer ..."
-                        />
-                      </label>
-                      <label>
-                        <span>Status</span>
-                        <select
-                          value={webhookDraft.enabled ? "enabled" : "disabled"}
-                          onChange={(event) =>
-                            updateWebhookDraft("enabled", event.target.value === "enabled")}
-                        >
-                          <option value="enabled">Enabled</option>
-                          <option value="disabled">Disabled</option>
-                        </select>
-                      </label>
-                    </>
-                  ) : null}
-
-                  {activeOutboundChannel === "slack" ? (
-                    <>
-                      <label>
-                        <span>Bot token</span>
-                        <input
-                          type="password"
-                          value={slackDraft.botToken}
-                          onChange={(event) => updateSlackDraft("botToken", event.target.value)}
-                          placeholder="xoxb-..."
-                        />
-                      </label>
-                      <label>
-                        <span>Channel ID</span>
-                        <input
-                          value={slackDraft.channelId}
-                          onChange={(event) => updateSlackDraft("channelId", event.target.value)}
-                          placeholder="C0123456789"
-                        />
-                      </label>
-                      <label>
-                        <span>Signing secret</span>
-                        <input
-                          type="password"
-                          value={slackDraft.signingSecret}
-                          onChange={(event) =>
-                            updateSlackDraft("signingSecret", event.target.value)}
-                          placeholder="Optional for outbound-only use"
-                        />
-                      </label>
-                      <label>
-                        <span>Status</span>
-                        <select
-                          value={slackDraft.enabled ? "enabled" : "disabled"}
-                          onChange={(event) =>
-                            updateSlackDraft("enabled", event.target.value === "enabled")}
-                        >
-                          <option value="enabled">Enabled</option>
-                          <option value="disabled">Disabled</option>
-                        </select>
-                      </label>
-                    </>
-                  ) : null}
-
-                  {activeOutboundChannel === "telegram" ? (
-                    <>
-                      <label>
-                        <span>Bot token</span>
-                        <input
-                          type="password"
-                          value={telegramDraft.botToken}
-                          onChange={(event) =>
-                            updateTelegramDraft("botToken", event.target.value)}
-                          placeholder="123456:ABCDEF..."
-                        />
-                      </label>
-                      <label>
-                        <span>Chat ID</span>
-                        <input
-                          value={telegramDraft.chatId}
-                          onChange={(event) => updateTelegramDraft("chatId", event.target.value)}
-                          placeholder="-1001234567890"
-                        />
-                      </label>
-                      <label>
-                        <span>Secret token</span>
-                        <input
-                          type="password"
-                          value={telegramDraft.secretToken}
-                          onChange={(event) =>
-                            updateTelegramDraft("secretToken", event.target.value)}
-                          placeholder="Optional secret token"
-                        />
-                      </label>
-                      <label>
-                        <span>Status</span>
-                        <select
-                          value={telegramDraft.enabled ? "enabled" : "disabled"}
-                          onChange={(event) =>
-                            updateTelegramDraft("enabled", event.target.value === "enabled")}
-                        >
-                          <option value="enabled">Enabled</option>
-                          <option value="disabled">Disabled</option>
-                        </select>
-                      </label>
-                    </>
-                  ) : null}
-                </div>
-
-                <div className="actions">
-                  <button
-                    className="primary-button"
-                    type="button"
-                    disabled={integrationBusy}
-                    onClick={() => handleSaveDeployment(activeOutboundChannel)}
-                  >
-                    {integrationBusy ? "Saving..." : `Save ${formatChannelName(activeOutboundChannel)}`}
-                  </button>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    disabled={integrationBusy || !activeOutboundDeployment}
-                    onClick={() => handleSendDeploymentTest(activeOutboundChannel)}
-                  >
-                    Send {formatChannelName(activeOutboundChannel)} test
-                  </button>
-                </div>
-
-                {deployments.length ? (
-                  <div className="stack-list deployment-list">
-                    {deployments.map((deployment) => (
-                      <article key={deployment.id} className="list-card">
-                        <strong>{formatChannelName(deployment.channel)}</strong>
-                        <p>{describeDeploymentTarget(deployment)}</p>
-                        <div className="tag-row">
-                          <span className="tag">{deployment.enabled ? "enabled" : "disabled"}</span>
-                          <span className="tag">{deployment.platformKey}</span>
-                          <span className="tag">{deployment.id}</span>
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                ) : null}
-              </>
-            ) : (
-              <p className="empty-state">先选择或创建一个角色，才能配置外部出口。</p>
-            )}
-
-            {integrationError ? <p className="error-banner">{integrationError}</p> : null}
-            {integrationSaved ? <p className="success-banner">{integrationSaved}</p> : null}
-          </div>
-
-          <div className="panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Export</p>
-                <h2>Conversation export</h2>
-              </div>
-            </div>
-
-            {conversation?.id ? (
-              <>
-                <p className="muted">
-                  导出当前会话，保留 assistant 回复里的 `generation` 和 `neuralRecord`。
-                  现在支持 JSON 和 Markdown 两种格式。
-                </p>
-                <div className="actions">
-                  <button
-                    className="primary-button"
-                    type="button"
-                    disabled={Boolean(exportBusy)}
-                    onClick={() => handleExportConversation("json")}
-                  >
-                    {exportBusy === "json" ? "Exporting..." : "Export JSON"}
-                  </button>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    disabled={Boolean(exportBusy)}
-                    onClick={() => handleExportConversation("markdown")}
-                  >
-                    {exportBusy === "markdown" ? "Exporting..." : "Export Markdown"}
-                  </button>
-                </div>
-
-                <div className="stack-list">
-                  <article className="list-card">
-                    <strong>Current conversation</strong>
-                    <p>{conversation.title}</p>
-                    <div className="tag-row">
-                      <span className="tag">{conversation.id}</span>
-                      <span className="tag">{currentMessages.length} messages</span>
-                      <span className="tag">{assistantTimeline.length} neural turns</span>
-                    </div>
-                  </article>
-                </div>
-              </>
-            ) : (
-              <p className="empty-state">当前没有会话，导出接口还没有内容可以打包。</p>
-            )}
-          </div>
-        </section>
+        {appSection === "characters" ? renderCharacterBuilder() : null}
+        {appSection === "chat" ? renderChatWorkspace() : null}
+        {appSection === "settings" ? renderSettingsWorkspace() : null}
       </main>
     </div>
   );

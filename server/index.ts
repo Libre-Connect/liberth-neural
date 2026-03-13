@@ -32,6 +32,7 @@ import {
 import type { LlmRuntimeConfig } from "./llm";
 import {
   buildCharacterRuntimeSystemPrompt,
+  composeCharacterFromBrief,
   generateBlueprint,
   generateRoleReplyDetailed,
 } from "./roles";
@@ -54,7 +55,7 @@ function ensureRoleDefinition(input: any): RoleDefinitionInput {
     boundaries: String(input?.boundaries || "").trim(),
     knowledge: String(input?.knowledge || "").trim(),
     greeting: String(input?.greeting || "").trim(),
-    language: String(input?.language || "Chinese").trim() || "Chinese",
+    language: String(input?.language || "English").trim() || "English",
   };
 }
 
@@ -74,6 +75,13 @@ function ensureProviderSettings(input: any): ProviderSettings {
   return normalizeProviderSettings(input);
 }
 
+function ensureCharacterBriefInput(input: any) {
+  return {
+    brief: String(input?.brief || "").trim(),
+    language: String(input?.language || "English").trim() || "English",
+  };
+}
+
 async function resolveProviderSettings() {
   const store = await readStore();
   return normalizeProviderSettings({
@@ -87,6 +95,7 @@ function providerToRuntimeConfig(provider: ProviderSettings): LlmRuntimeConfig {
     ? {
         providerMode: "glm-main",
         glmModel: provider.glmModel,
+        apiKey: provider.apiKey,
       }
     : {
         providerMode: provider.providerMode,
@@ -97,6 +106,24 @@ function providerToRuntimeConfig(provider: ProviderSettings): LlmRuntimeConfig {
         anthropicVersion: provider.anthropicVersion,
         googleApiVersion: provider.googleApiVersion,
       };
+}
+
+function publicProviderSettings(provider: ProviderSettings): ProviderSettings {
+  return {
+    ...provider,
+    apiKey: "",
+  };
+}
+
+function mergeProviderSettings(
+  existing: ProviderSettings | undefined,
+  incoming: ProviderSettings,
+): ProviderSettings {
+  return {
+    ...incoming,
+    apiKey:
+      incoming.apiKey || (existing?.providerMode === incoming.providerMode ? existing.apiKey : ""),
+  };
 }
 
 function buildAssistantNeuralRecord(input: {
@@ -180,7 +207,7 @@ async function createConversationRecord(
   return {
     id: randomId("conv"),
     characterId: character.id,
-    title: `${character.definition.name} neural chat`,
+    title: "New chat",
     createdAt: Date.now(),
     updatedAt: Date.now(),
     messages: starterConversation(character),
@@ -626,23 +653,25 @@ app.get("/api/characters", async (_req, res) => {
 });
 
 app.get("/api/settings/provider", async (_req, res) => {
-  res.json({ provider: await resolveProviderSettings() });
+  res.json({ provider: publicProviderSettings(await resolveProviderSettings()) });
 });
 
 app.get("/api/providers", async (_req, res) => {
   const provider = await resolveProviderSettings();
   res.json({
     providers: providerCatalog,
-    activeProvider: provider,
+    activeProvider: publicProviderSettings(provider),
   });
 });
 
 app.put("/api/settings/provider", async (req, res) => {
   const provider = ensureProviderSettings(req.body?.provider);
+  let savedProvider = provider;
   await updateStore((store) => {
-    store.settings = { provider };
+    savedProvider = mergeProviderSettings(store.settings?.provider, provider);
+    store.settings = { provider: savedProvider };
   });
-  res.json({ provider });
+  res.json({ provider: publicProviderSettings(savedProvider) });
 });
 
 app.post("/api/characters/generate", async (req, res) => {
@@ -651,6 +680,23 @@ app.post("/api/characters/generate", async (req, res) => {
     validateDefinition(definition);
     const blueprint = await generateBlueprint(definition);
     res.json({ blueprint });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.post("/api/characters/compose", async (req, res) => {
+  try {
+    const input = ensureCharacterBriefInput(req.body);
+    if (!input.brief) {
+      throw new Error("Character brief is required");
+    }
+    const provider = await resolveProviderSettings();
+    const payload = await composeCharacterFromBrief({
+      ...input,
+      config: providerToRuntimeConfig(provider),
+    });
+    res.json(payload);
   } catch (error: any) {
     res.status(400).json({ message: String(error?.message || error) });
   }
@@ -717,9 +763,41 @@ app.put("/api/characters", async (req, res) => {
 app.get("/api/conversations", async (req, res) => {
   const characterId = String(req.query.characterId || "").trim();
   const store = await readStore();
-  const conversation =
-    store.conversations.find((item) => item.characterId === characterId) || null;
+  const conversations = store.conversations
+    .filter((item) => !characterId || item.characterId === characterId)
+    .slice()
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+  res.json({ conversations });
+});
+
+app.get("/api/conversations/:conversationId", async (req, res) => {
+  const conversationId = String(req.params.conversationId || "").trim();
+  const store = await readStore();
+  const conversation = store.conversations.find((item) => item.id === conversationId) || null;
+  if (!conversation) {
+    return res.status(404).json({ message: "Conversation not found" });
+  }
   res.json({ conversation });
+});
+
+app.post("/api/conversations", async (req, res) => {
+  try {
+    const characterId = String(req.body?.characterId || "").trim();
+    if (!characterId) {
+      throw new Error("characterId is required");
+    }
+    const character = await getCharacterById(characterId);
+    if (!character) {
+      return res.status(404).json({ message: "Character not found" });
+    }
+    const conversation = await createConversationRecord(character);
+    await updateStore((store) => {
+      upsertConversation(store, conversation);
+    });
+    res.json({ conversation });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
 });
 
 app.get("/api/deployments", async (req, res) => {
@@ -923,6 +1001,7 @@ app.post("/api/chat", async (req, res) => {
 
     const replyResult = await generateRoleReplyDetailed({
       systemPrompt,
+      definition: character.definition,
       history,
       userMessage: message,
       config: providerToRuntimeConfig(provider),

@@ -12,6 +12,7 @@ import {
   deriveNeuralStateSnapshot,
 } from "./neural-engine";
 import {
+  completeJsonDetailed,
   completeTextDetailed,
   type LlmRuntimeConfig,
 } from "./llm";
@@ -58,6 +59,64 @@ function createStarterQuestions(definition: RoleDefinitionInput, language: "zh" 
     "If I add more persona notes, how would your identity and boundaries shift?",
     "Give me the conclusion first, then explain the dominant neural route behind it.",
   ];
+}
+
+function titleCaseWords(value: string) {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function fallbackDefinitionFromBrief(input: {
+  brief: string;
+  language: string;
+}): RoleDefinitionInput {
+  const brief = String(input.brief || "").trim();
+  const language = String(input.language || "English").trim() || "English";
+  const compact = brief.replace(/\s+/g, " ").trim();
+  const words = compact
+    .replace(/[^a-zA-Z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 4);
+  const name = titleCaseWords(words.join(" ")) || "Neural Character";
+  const oneLiner = compact || "A focused neural character built from a concise brief.";
+
+  return {
+    name,
+    oneLiner,
+    domain: "advisory dialogue",
+    audience: "general users",
+    tone: "clear, grounded, and direct",
+    personality: `A role-consistent character shaped by this concept: ${oneLiner}`,
+    goals: "Stay useful, coherent, and aligned with the character brief.",
+    boundaries: "Do not break character continuity, invent hidden capabilities, or cross explicit safety boundaries.",
+    knowledge: oneLiner,
+    greeting: `Hi, I'm ${name}. I'll respond through this neural character lens.`,
+    language,
+  };
+}
+
+function normalizeExpandedDefinition(
+  input: Partial<RoleDefinitionInput> | null | undefined,
+  fallback: RoleDefinitionInput,
+): RoleDefinitionInput {
+  return {
+    name: String(input?.name || fallback.name).trim() || fallback.name,
+    oneLiner: String(input?.oneLiner || fallback.oneLiner).trim() || fallback.oneLiner,
+    domain: String(input?.domain || fallback.domain).trim() || fallback.domain,
+    audience: String(input?.audience || fallback.audience).trim() || fallback.audience,
+    tone: String(input?.tone || fallback.tone).trim() || fallback.tone,
+    personality:
+      String(input?.personality || fallback.personality).trim() || fallback.personality,
+    goals: String(input?.goals || fallback.goals).trim() || fallback.goals,
+    boundaries: String(input?.boundaries || fallback.boundaries).trim() || fallback.boundaries,
+    knowledge: String(input?.knowledge || fallback.knowledge).trim() || fallback.knowledge,
+    greeting: String(input?.greeting || fallback.greeting).trim() || fallback.greeting,
+    language: String(input?.language || fallback.language).trim() || fallback.language,
+  };
 }
 
 function createGenerationTrace(): GenerationTrace {
@@ -197,21 +256,81 @@ export async function generateBlueprint(
   return buildBlueprint(definition);
 }
 
+export async function composeCharacterFromBrief(input: {
+  brief: string;
+  language?: string;
+  config?: LlmRuntimeConfig;
+}) {
+  const fallback = fallbackDefinitionFromBrief({
+    brief: input.brief,
+    language: input.language || "English",
+  });
+
+  const expansion = await completeJsonDetailed<RoleDefinitionInput>(
+    [
+      {
+        role: "system",
+        content: [
+          "You are a neural character designer.",
+          "Expand a one-line character concept into JSON only.",
+          "Return exactly these fields: name, oneLiner, domain, audience, tone, personality, goals, boundaries, knowledge, greeting, language.",
+          "Keep every field concise, specific, and internally consistent.",
+          "The language field must be a plain human-readable label such as English or Chinese.",
+          "Do not include markdown fences or explanations.",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          `Target language: ${fallback.language}`,
+          `Character brief: ${input.brief}`,
+          "Expand this into a complete neural character definition JSON now.",
+        ].join("\n"),
+      },
+    ],
+    () => fallback,
+    input.config,
+  );
+
+  const definition = normalizeExpandedDefinition(expansion.value, fallback);
+  const blueprint = await generateBlueprint(definition, input.config);
+
+  return {
+    definition,
+    blueprint,
+    expansion: expansion.trace,
+  };
+}
+
 export async function generateRoleReplyDetailed(input: {
   systemPrompt: string;
+  definition?: RoleDefinitionInput;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userMessage: string;
   config?: LlmRuntimeConfig;
 }) {
   const fallback = () => {
     const historyTurns = input.history.length;
+    const language = inferPromptLanguage(
+      input.definition || fallbackDefinitionFromBrief({ brief: "", language: "English" }),
+    );
+    if (language === "zh") {
+      return [
+        "我会按当前神经元角色设定来回答。",
+        `你刚才的问题是：“${input.userMessage}”。`,
+        historyTurns > 0
+          ? `我已经接住这段对话里的最近 ${historyTurns} 轮上下文。`
+          : "这是这段神经元对话的第一轮刺激。",
+        "如果你想改变人格、目标或边界，请回到角色工作台重新生成角色。",
+      ].join("\n");
+    }
     return [
-      "我会按当前神经元角色设定来回答。",
-      `你刚才的问题是：“${input.userMessage}”。`,
+      "I will answer through the current neural character definition.",
+      `Your latest message was: "${input.userMessage}".`,
       historyTurns > 0
-        ? `我已经接住这段对话里的最近 ${historyTurns} 轮上下文。`
-        : "这是这段神经元对话的第一轮刺激。",
-      "如果你想改变人格、目标或边界，请回到角色工作台重新生成角色。",
+        ? `I am carrying the latest ${historyTurns} turns of local context into this reply.`
+        : "This is the first stimulus in this neural conversation.",
+      "If you want to change the persona, goals, or boundaries, go back to the character builder and regenerate the role.",
     ].join("\n");
   };
 
@@ -233,6 +352,7 @@ export async function generateRoleReplyDetailed(input: {
 
 export async function generateRoleReply(input: {
   systemPrompt: string;
+  definition?: RoleDefinitionInput;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userMessage: string;
   config?: LlmRuntimeConfig;

@@ -52,7 +52,7 @@ export const providerCatalog: ProviderCatalogItem[] = [
     description: "Native Zhipu GLM access for the built-in neural dialogue path.",
     apiStyle: "glm-main",
     defaultModel: "glm-4-flash-250414",
-    apiKeyPlaceholder: "ZHIPUAI_API_KEY / GLM_API_KEY",
+    apiKeyPlaceholder: "Enter GLM API key",
   },
   {
     id: "openai-compatible",
@@ -521,7 +521,7 @@ export const emptyRoleDefinition = (): RoleDefinitionInput => ({
   boundaries: "",
   knowledge: "",
   greeting: "",
-  language: "Chinese",
+  language: "English",
 });
 
 export const emptyProviderSettings = (): ProviderSettings => {

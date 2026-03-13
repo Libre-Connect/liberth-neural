@@ -31,7 +31,7 @@ function fallbackBundle(character: CharacterRecord): RoleBundle {
     ].join("\n"),
     style: [
       `Tone: ${definition.tone || "clear and direct"}`,
-      `Default language: ${definition.language || "Chinese"}`,
+      `Default language: ${definition.language || "English"}`,
       "Prefer concise answers first, then expand when the user asks for depth.",
     ].join("\n"),
     identity: [

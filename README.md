@@ -211,7 +211,9 @@ The current provider matrix includes:
 
 The provider adapter lives in [`server/llm.ts`](./server/llm.ts). The runtime
 passes a compiled system prompt and short conversation history into that layer,
-then stores the resulting provider trace alongside the assistant reply.
+then stores the resulting provider trace alongside the assistant reply. GLM now
+follows the same manual runtime-key flow as the other hosted providers, and the
+API never returns saved provider keys to the frontend.
 
 ## Repository layout
 
@@ -315,9 +317,12 @@ to `http://localhost:4318`.
 
 ## Environment
 
-You configure provider access through [`.env.example`](./.env.example). The
-template includes editable sections for GLM, OpenAI-compatible endpoints,
-OpenRouter, DeepSeek, SiliconFlow, Groq, Ollama, Anthropic, and Google Gemini.
+You configure provider access through the runtime settings panel. API keys are
+write-only there, so the server stores them without echoing them back to the
+client. [`.env.example`](./.env.example) still contains optional server-side
+defaults for OpenAI-compatible endpoints, OpenRouter, DeepSeek, SiliconFlow,
+Groq, Ollama, Anthropic, and Google Gemini. GLM intentionally uses the runtime
+settings flow for its API key.
 
 If you only want local inspection without live model calls, you can still read
 the compiled blueprint path and type contracts. If you want full chat runtime

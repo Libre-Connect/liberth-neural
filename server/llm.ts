@@ -65,25 +65,13 @@ function envPrefixForMode(mode: ProviderMode) {
   }
 }
 
-function resolveGlmApiKey() {
-  return (
-    resolveEnv("ZHIPUAI_API_KEY") ||
-    resolveEnv("GLM_API_KEY") ||
-    resolveEnv("BIGMODEL_API_KEY")
-  );
-}
-
-function hasGlmAccess() {
-  return Boolean(resolveGlmApiKey());
-}
-
 function resolveApiKeyForMode(mode: ProviderMode, explicit?: string) {
   const direct = pickNonEmpty(explicit);
   if (direct) return direct;
 
   switch (mode) {
     case "glm-main":
-      return resolveGlmApiKey();
+      return "";
     case "openrouter":
       return resolveEnv("OPENROUTER_API_KEY");
     case "deepseek":
@@ -154,9 +142,6 @@ function resolveTrace(config?: LlmRuntimeConfig, mode: GenerationMode = "llm", r
 
 export function hasLlmAccess(config?: LlmRuntimeConfig) {
   const runtime = resolveRuntimeConfig(config);
-  if (runtime.providerMode === "glm-main") {
-    return hasGlmAccess();
-  }
   if (runtime.providerMode === "ollama") {
     return Boolean(runtime.baseUrl && runtime.model);
   }
@@ -337,15 +322,14 @@ async function mainProjectGlmChat(
   config?: LlmRuntimeConfig,
 ) {
   const runtime = resolveRuntimeConfig(config);
-  const apiKey = resolveGlmApiKey();
-  if (!apiKey) {
-    throw new Error("ZHIPUAI_API_KEY is not configured");
+  if (!runtime.apiKey) {
+    throw new Error("GLM API key is not configured");
   }
 
   const response = await fetch(`${ZHIPUAI_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${runtime.apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
