@@ -5,10 +5,15 @@ import path from "path";
 import type {
   CharacterRecord,
   ConversationRecord,
+  DeploymentChannel,
+  DeploymentPlatformKey,
+  DeploymentRecord,
   NeuralMemoryRecord,
+  NeuralRecord,
   ProviderSettings,
   RoleDefinitionInput,
 } from "../src/types";
+import { providerCatalog } from "../src/types";
 import {
   deriveDurableMemoryCandidate,
   deriveNeuralStateSnapshot,
@@ -22,6 +27,7 @@ import {
   updateStore,
   upsertCharacter,
   upsertConversation,
+  upsertDeployment,
 } from "./store";
 import type { LlmRuntimeConfig } from "./llm";
 import {
@@ -83,12 +89,71 @@ function providerToRuntimeConfig(provider: ProviderSettings): LlmRuntimeConfig {
         glmModel: provider.glmModel,
       }
     : {
-        providerMode: "openai-compatible",
+        providerMode: provider.providerMode,
         glmModel: provider.glmModel,
-        apiKey: provider.openaiApiKey,
-        baseUrl: provider.openaiBaseUrl,
-        model: provider.openaiModel,
+        apiKey: provider.apiKey,
+        baseUrl: provider.baseUrl,
+        model: provider.model,
+        anthropicVersion: provider.anthropicVersion,
+        googleApiVersion: provider.googleApiVersion,
       };
+}
+
+function buildAssistantNeuralRecord(input: {
+  generation: NonNullable<ConversationRecord["messages"][number]["generation"]>;
+  neuralState: CharacterRecord["lastNeuralState"];
+  durableMemoryCandidate: string | null;
+}): NeuralRecord {
+  const neuralState = input.neuralState;
+  if (!neuralState) {
+    return {
+      recordedAt: Date.now(),
+      dominantRoute: "respond",
+      turnSummary: "No neural state was captured for this turn.",
+      broadcastSummary: "",
+      routeInspector: {
+        dominantRoute: "respond",
+        dominantWeight: 0,
+        margin: 0,
+        because: [],
+        supportingNeurons: [],
+        alternatives: [],
+      },
+      modulators: {
+        focus: 0,
+        novelty: 0,
+        sociality: 0,
+        caution: 0,
+        confidence: 0,
+      },
+      workspaceContents: [],
+      topNeurons: [],
+      memoryDirective: {
+        writeGlobalMemory: false,
+        consolidatePreference: false,
+        preferenceStrength: 0,
+        reason: "",
+        durableMemoryCandidate: null,
+      },
+      provider: input.generation,
+    };
+  }
+
+  return {
+    recordedAt: Date.now(),
+    dominantRoute: neuralState.dominantRoute,
+    turnSummary: neuralState.summary,
+    broadcastSummary: neuralState.broadcastSummary,
+    routeInspector: neuralState.routeInspector,
+    modulators: neuralState.modulators,
+    workspaceContents: neuralState.workspaceContents.slice(0, 6),
+    topNeurons: neuralState.topNeurons.slice(0, 6),
+    memoryDirective: {
+      ...neuralState.memoryDirective,
+      durableMemoryCandidate: input.durableMemoryCandidate || null,
+    },
+    provider: input.generation,
+  };
 }
 
 function starterConversation(character: CharacterRecord) {
@@ -137,6 +202,362 @@ function normalizeMemoryText(value: string) {
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+}
+
+function trimValue(value: unknown) {
+  return String(value || "").trim();
+}
+
+function ensureDeploymentChannel(value: unknown): DeploymentChannel {
+  const normalized = trimValue(value);
+  if (normalized === "telegram" || normalized === "slack" || normalized === "webhook") {
+    return normalized;
+  }
+  return "webhook";
+}
+
+function ensureDeploymentPlatformKey(
+  value: unknown,
+  fallback: DeploymentChannel,
+): DeploymentPlatformKey {
+  const normalized = trimValue(value);
+  if (
+    normalized === "telegram"
+    || normalized === "slack"
+    || normalized === "discord"
+    || normalized === "feishu"
+    || normalized === "teams"
+    || normalized === "webhook"
+  ) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizeDeploymentInput(
+  input: any,
+  existing?: DeploymentRecord | null,
+): DeploymentRecord {
+  const channel = ensureDeploymentChannel(input?.channel || existing?.channel);
+  const platformKey = ensureDeploymentPlatformKey(
+    input?.platformKey || existing?.platformKey,
+    channel,
+  );
+
+  return {
+    id: existing?.id || randomId("dep"),
+    characterId: trimValue(input?.characterId || existing?.characterId),
+    secret: existing?.secret || randomId("depsec"),
+    channel,
+    platformKey,
+    enabled: input?.enabled !== false,
+    createdAt: existing?.createdAt || Date.now(),
+    updatedAt: Date.now(),
+    sessionByConversation: existing?.sessionByConversation || {},
+    telegram: {
+      botToken: trimValue(input?.telegram?.botToken || existing?.telegram?.botToken),
+      chatId: trimValue(input?.telegram?.chatId || existing?.telegram?.chatId),
+      secretToken: trimValue(
+        input?.telegram?.secretToken || existing?.telegram?.secretToken,
+      ),
+    },
+    slack: {
+      botToken: trimValue(input?.slack?.botToken || existing?.slack?.botToken),
+      channelId: trimValue(input?.slack?.channelId || existing?.slack?.channelId),
+      signingSecret: trimValue(
+        input?.slack?.signingSecret || existing?.slack?.signingSecret,
+      ),
+    },
+    webhook: {
+      outboundUrl: trimValue(
+        input?.webhook?.outboundUrl || existing?.webhook?.outboundUrl,
+      ),
+      outboundAuthHeader: trimValue(
+        input?.webhook?.outboundAuthHeader || existing?.webhook?.outboundAuthHeader,
+      ),
+    },
+  };
+}
+
+function toIso(value: number) {
+  try {
+    return new Date(value).toISOString();
+  } catch {
+    return String(value || "");
+  }
+}
+
+function buildConversationExportMarkdown(input: {
+  character: CharacterRecord | null;
+  conversation: ConversationRecord;
+}) {
+  const { character, conversation } = input;
+  const lines: string[] = [];
+  lines.push(`# ${character?.definition.name || conversation.title}`);
+  lines.push("");
+  lines.push(`- conversationId: ${conversation.id}`);
+  lines.push(`- characterId: ${conversation.characterId}`);
+  lines.push(`- exportedAt: ${new Date().toISOString()}`);
+  lines.push(`- updatedAt: ${toIso(conversation.updatedAt)}`);
+  lines.push("");
+
+  for (const message of conversation.messages) {
+    lines.push(`## ${message.role.toUpperCase()} · ${toIso(message.createdAt)}`);
+    lines.push("");
+    lines.push(message.content);
+    lines.push("");
+
+    if (message.role === "assistant" && message.generation) {
+      lines.push("### Generation");
+      lines.push("");
+      lines.push(`- mode: ${message.generation.mode}`);
+      lines.push(`- provider: ${message.generation.providerMode}`);
+      lines.push(`- model: ${message.generation.model}`);
+      lines.push("");
+    }
+
+    if (message.role === "assistant" && message.neuralRecord) {
+      lines.push("### Neural Record");
+      lines.push("");
+      lines.push(`- dominantRoute: ${message.neuralRecord.dominantRoute}`);
+      lines.push(`- broadcastSummary: ${message.neuralRecord.broadcastSummary || "-"}`);
+      lines.push(
+        `- memoryWriteback: ${message.neuralRecord.memoryDirective.writeGlobalMemory ? "yes" : "no"}`,
+      );
+      lines.push(
+        `- durableMemoryCandidate: ${message.neuralRecord.memoryDirective.durableMemoryCandidate || "-"}`,
+      );
+      if (message.neuralRecord.routeInspector.because.length) {
+        lines.push("");
+        lines.push("#### Why this route");
+        lines.push("");
+        for (const reason of message.neuralRecord.routeInspector.because) {
+          lines.push(`- ${reason}`);
+        }
+      }
+      lines.push("");
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function isHttpUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function validateDeploymentRecord(deployment: DeploymentRecord) {
+  if (!deployment.characterId) {
+    throw new Error("characterId is required");
+  }
+
+  if (!deployment.enabled) {
+    return;
+  }
+
+  if (deployment.channel === "webhook") {
+    if (!deployment.webhook?.outboundUrl) {
+      throw new Error("webhook outboundUrl is required");
+    }
+    if (!isHttpUrl(deployment.webhook.outboundUrl)) {
+      throw new Error("webhook outboundUrl must be a valid http or https URL");
+    }
+    return;
+  }
+
+  if (deployment.channel === "slack") {
+    if (!deployment.slack?.botToken) {
+      throw new Error("slack botToken is required");
+    }
+    if (!deployment.slack?.channelId) {
+      throw new Error("slack channelId is required");
+    }
+    return;
+  }
+
+  if (!deployment.telegram?.botToken) {
+    throw new Error("telegram botToken is required");
+  }
+  if (!deployment.telegram?.chatId) {
+    throw new Error("telegram chatId is required");
+  }
+}
+
+function parseJsonMaybe(value: string) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function trimResponseText(value: string) {
+  return String(value || "").slice(0, 1200);
+}
+
+function describeDeploymentTarget(deployment: DeploymentRecord) {
+  if (deployment.channel === "webhook") {
+    return deployment.webhook?.outboundUrl || "(missing webhook url)";
+  }
+  if (deployment.channel === "slack") {
+    return deployment.slack?.channelId || "(missing slack channel)";
+  }
+  return deployment.telegram?.chatId || "(missing telegram chat)";
+}
+
+function buildOutboundDeliveryText(input: {
+  character: CharacterRecord;
+  conversation: ConversationRecord | null;
+  latestAssistantMessage: ConversationRecord["messages"][number] | null;
+}) {
+  const { character, conversation, latestAssistantMessage } = input;
+  const record = latestAssistantMessage?.role === "assistant"
+    ? latestAssistantMessage.neuralRecord
+    : null;
+  const lines = [
+    "Liberth Neural outbound test",
+    `Character: ${character.definition.name}`,
+    `Character ID: ${character.id}`,
+    `Conversation: ${conversation?.title || "No conversation yet"}`,
+    `Conversation ID: ${conversation?.id || "-"}`,
+    `Route: ${record?.dominantRoute || "-"}`,
+    `Summary: ${record?.broadcastSummary || record?.turnSummary || "-"}`,
+    `Top neurons: ${record?.topNeurons.map((item) => item.neuronId).join(", ") || "-"}`,
+    "",
+    "Reply:",
+    latestAssistantMessage?.content || "No assistant turn has been recorded yet.",
+  ];
+  return lines.join("\n");
+}
+
+function buildOutboundDeliveryPayload(input: {
+  deployment: DeploymentRecord;
+  character: CharacterRecord;
+  conversation: ConversationRecord | null;
+  latestAssistantMessage: ConversationRecord["messages"][number] | null;
+}) {
+  const { deployment, character, conversation, latestAssistantMessage } = input;
+  return {
+    event: "liberth-neural.outbound-test",
+    exportedAt: new Date().toISOString(),
+    deployment: {
+      id: deployment.id,
+      channel: deployment.channel,
+      platformKey: deployment.platformKey,
+      target: describeDeploymentTarget(deployment),
+    },
+    character: {
+      id: character.id,
+      slug: character.slug,
+      name: character.definition.name,
+      oneLiner: character.definition.oneLiner,
+    },
+    conversation: conversation
+      ? {
+          id: conversation.id,
+          title: conversation.title,
+          updatedAt: conversation.updatedAt,
+          messageCount: conversation.messages.length,
+        }
+      : null,
+    latestAssistantMessage,
+    lastNeuralState: character.lastNeuralState || null,
+    globalMemories: Array.isArray(character.globalMemories) ? character.globalMemories : [],
+  };
+}
+
+async function sendWebhookDelivery(input: {
+  deployment: DeploymentRecord;
+  payload: ReturnType<typeof buildOutboundDeliveryPayload>;
+}) {
+  const { deployment, payload } = input;
+  const response = await fetch(String(deployment.webhook?.outboundUrl || ""), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Liberth-Deployment-Secret": deployment.secret,
+      ...(deployment.webhook?.outboundAuthHeader
+        ? {
+            Authorization: deployment.webhook.outboundAuthHeader,
+          }
+        : {}),
+    },
+    body: JSON.stringify(payload),
+  });
+  const responseText = await response.text();
+  return {
+    ok: response.ok,
+    status: response.status,
+    statusText: response.statusText,
+    responseText: trimResponseText(responseText),
+  };
+}
+
+async function sendSlackDelivery(input: {
+  deployment: DeploymentRecord;
+  text: string;
+}) {
+  const { deployment, text } = input;
+  const response = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      Authorization: `Bearer ${deployment.slack?.botToken || ""}`,
+    },
+    body: JSON.stringify({
+      channel: deployment.slack?.channelId || "",
+      text,
+      unfurl_links: false,
+      unfurl_media: false,
+    }),
+  });
+  const responseText = await response.text();
+  const body = parseJsonMaybe(responseText);
+  return {
+    ok: Boolean(response.ok && body?.ok !== false),
+    status: response.status,
+    statusText: String(body?.error || response.statusText || ""),
+    responseText: trimResponseText(responseText),
+  };
+}
+
+async function sendTelegramDelivery(input: {
+  deployment: DeploymentRecord;
+  text: string;
+}) {
+  const { deployment, text } = input;
+  const response = await fetch(
+    `https://api.telegram.org/bot${deployment.telegram?.botToken || ""}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(deployment.telegram?.secretToken
+          ? {
+              "X-Telegram-Bot-Api-Secret-Token": deployment.telegram.secretToken,
+            }
+          : {}),
+      },
+      body: JSON.stringify({
+        chat_id: deployment.telegram?.chatId || "",
+        text,
+        disable_web_page_preview: true,
+      }),
+    },
+  );
+  const responseText = await response.text();
+  const body = parseJsonMaybe(responseText);
+  return {
+    ok: Boolean(response.ok && body?.ok !== false),
+    status: response.status,
+    statusText: String(body?.description || response.statusText || ""),
+    responseText: trimResponseText(responseText),
+  };
 }
 
 function appendGlobalMemory(
@@ -206,6 +627,14 @@ app.get("/api/characters", async (_req, res) => {
 
 app.get("/api/settings/provider", async (_req, res) => {
   res.json({ provider: await resolveProviderSettings() });
+});
+
+app.get("/api/providers", async (_req, res) => {
+  const provider = await resolveProviderSettings();
+  res.json({
+    providers: providerCatalog,
+    activeProvider: provider,
+  });
 });
 
 app.put("/api/settings/provider", async (req, res) => {
@@ -293,6 +722,165 @@ app.get("/api/conversations", async (req, res) => {
   res.json({ conversation });
 });
 
+app.get("/api/deployments", async (req, res) => {
+  const characterId = String(req.query.characterId || "").trim();
+  const store = await readStore();
+  const deployments = characterId
+    ? store.deployments.filter((item) => item.characterId === characterId)
+    : store.deployments;
+  res.json({ deployments });
+});
+
+app.get("/api/characters/:characterId/neural-state", async (req, res) => {
+  const characterId = String(req.params.characterId || "").trim();
+  const character = await getCharacterById(characterId);
+  if (!character) {
+    return res.status(404).json({ message: "Character not found" });
+  }
+
+  res.json({
+    characterId: character.id,
+    characterName: character.definition.name,
+    lastNeuralState: character.lastNeuralState || null,
+    globalMemories: Array.isArray(character.globalMemories) ? character.globalMemories : [],
+    blueprint: {
+      summary: character.blueprint.summary,
+      generation: character.blueprint.generation || null,
+      neuralGraphManifest: character.blueprint.neuralGraph?.manifest || null,
+    },
+  });
+});
+
+app.get("/api/conversations/:conversationId/neural-records", async (req, res) => {
+  const conversationId = String(req.params.conversationId || "").trim();
+  const store = await readStore();
+  const conversation = store.conversations.find((item) => item.id === conversationId) || null;
+  if (!conversation) {
+    return res.status(404).json({ message: "Conversation not found" });
+  }
+
+  const records = conversation.messages
+    .filter((message) => message.role === "assistant" && message.neuralRecord)
+    .map((message) => ({
+      messageId: message.id,
+      createdAt: message.createdAt,
+      reply: message.content,
+      neuralRecord: message.neuralRecord || null,
+    }));
+
+  res.json({
+    conversationId: conversation.id,
+    characterId: conversation.characterId,
+    title: conversation.title,
+    records,
+  });
+});
+
+app.post("/api/deployments", async (req, res) => {
+  try {
+    const id = trimValue(req.body?.deployment?.id);
+    const store = await readStore();
+    const existing = id
+      ? store.deployments.find((item) => item.id === id) || null
+      : null;
+    const deployment = normalizeDeploymentInput(req.body?.deployment, existing);
+
+    validateDeploymentRecord(deployment);
+
+    await updateStore((draft) => {
+      upsertDeployment(draft, deployment);
+    });
+
+    res.json({ deployment });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.post("/api/deployments/:deploymentId/send-test", async (req, res) => {
+  try {
+    const deploymentId = String(req.params.deploymentId || "").trim();
+    const conversationId = trimValue(req.body?.conversationId);
+    if (!deploymentId) {
+      throw new Error("deploymentId is required");
+    }
+
+    const store = await readStore();
+    const deployment = store.deployments.find((item) => item.id === deploymentId) || null;
+    if (!deployment) {
+      return res.status(404).json({ message: "Deployment not found" });
+    }
+    validateDeploymentRecord(deployment);
+
+    const character = await getCharacterById(deployment.characterId);
+    if (!character) {
+      return res.status(404).json({ message: "Character not found" });
+    }
+
+    const conversation = conversationId
+      ? store.conversations.find((item) => item.id === conversationId) || null
+      : store.conversations.find((item) => item.characterId === deployment.characterId) || null;
+
+    const latestAssistantMessage = conversation
+      ? [...conversation.messages].reverse().find((item) => item.role === "assistant") || null
+      : null;
+
+    const payload = buildOutboundDeliveryPayload({
+      deployment,
+      character,
+      conversation,
+      latestAssistantMessage,
+    });
+    const text = buildOutboundDeliveryText({
+      character,
+      conversation,
+      latestAssistantMessage,
+    });
+
+    const result = deployment.channel === "webhook"
+      ? await sendWebhookDelivery({ deployment, payload })
+      : deployment.channel === "slack"
+      ? await sendSlackDelivery({ deployment, text })
+      : await sendTelegramDelivery({ deployment, text });
+
+    res.json({
+      channel: deployment.channel,
+      target: describeDeploymentTarget(deployment),
+      ...result,
+    });
+  } catch (error: any) {
+    res.status(400).json({ message: String(error?.message || error) });
+  }
+});
+
+app.get("/api/conversations/:conversationId/export", async (req, res) => {
+  const conversationId = String(req.params.conversationId || "").trim();
+  const format = String(req.query.format || "json").trim().toLowerCase();
+  const store = await readStore();
+  const conversation = store.conversations.find((item) => item.id === conversationId) || null;
+  if (!conversation) {
+    return res.status(404).json({ message: "Conversation not found" });
+  }
+
+  const character = store.characters.find((item) => item.id === conversation.characterId) || null;
+
+  if (format === "markdown" || format === "md") {
+    res.type("text/markdown").send(
+      buildConversationExportMarkdown({
+        character,
+        conversation,
+      }),
+    );
+    return;
+  }
+
+  res.json({
+    exportedAt: new Date().toISOString(),
+    character,
+    conversation,
+  });
+});
+
 app.post("/api/chat", async (req, res) => {
   try {
     const characterId = String(req.body?.characterId || "").trim();
@@ -346,11 +934,18 @@ app.post("/api/chat", async (req, res) => {
       content: message,
       createdAt: Date.now(),
     };
+    const durableMemory = deriveDurableMemoryCandidate(message, neuralState);
     const assistantEntry = {
       id: randomId("msg"),
       role: "assistant" as const,
       content: replyResult.reply,
       createdAt: Date.now(),
+      generation: replyResult.generation,
+      neuralRecord: buildAssistantNeuralRecord({
+        generation: replyResult.generation,
+        neuralState,
+        durableMemoryCandidate: durableMemory,
+      }),
     };
 
     const nextConversation: ConversationRecord = {
@@ -362,7 +957,6 @@ app.post("/api/chat", async (req, res) => {
       messages: [...conversation.messages, userEntry, assistantEntry],
     };
 
-    const durableMemory = deriveDurableMemoryCandidate(message, neuralState);
     const nextCharacter: CharacterRecord = {
       ...character,
       updatedAt: Date.now(),

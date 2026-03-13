@@ -11,6 +11,7 @@ import type {
   ProviderSettings,
   StoreShape,
 } from "../src/types";
+import { getProviderCatalogItem } from "../src/types";
 import { storeFilePath } from "./project-paths";
 
 export const DEFAULT_GLM_MODEL = "glm-4-flash-250414";
@@ -19,33 +20,47 @@ function trimValue(value: unknown) {
   return String(value || "").trim();
 }
 
-function hasOpenAiOverrides(input?: Partial<ProviderSettings>) {
+function hasProviderOverrides(
+  input?: Partial<ProviderSettings> & {
+    openaiApiKey?: string;
+    openaiBaseUrl?: string;
+    openaiModel?: string;
+  },
+) {
   return Boolean(
-    trimValue(input?.openaiApiKey) ||
+    trimValue(input?.apiKey) ||
+      trimValue(input?.baseUrl) ||
+      trimValue(input?.model) ||
+      trimValue(input?.openaiApiKey) ||
       trimValue(input?.openaiBaseUrl) ||
       trimValue(input?.openaiModel),
   );
 }
 
 export function normalizeProviderSettings(
-  input?: Partial<ProviderSettings>,
+  input?: Partial<ProviderSettings> & {
+    openaiApiKey?: string;
+    openaiBaseUrl?: string;
+    openaiModel?: string;
+  },
 ): ProviderSettings {
-  const openaiApiKey = trimValue(input?.openaiApiKey);
-  const openaiBaseUrl = trimValue(input?.openaiBaseUrl);
-  const openaiModel = trimValue(input?.openaiModel);
   const providerMode =
-    input?.providerMode === "glm-main" || input?.providerMode === "openai-compatible"
+    input?.providerMode && getProviderCatalogItem(input.providerMode).id === input.providerMode
       ? input.providerMode
-      : hasOpenAiOverrides(input)
+      : hasProviderOverrides(input)
         ? "openai-compatible"
         : "glm-main";
+  const preset = getProviderCatalogItem(providerMode);
 
   return {
     providerMode,
     glmModel: trimValue(input?.glmModel) || DEFAULT_GLM_MODEL,
-    openaiApiKey,
-    openaiBaseUrl,
-    openaiModel,
+    apiKey: trimValue(input?.apiKey) || trimValue(input?.openaiApiKey),
+    baseUrl:
+      trimValue(input?.baseUrl) || trimValue(input?.openaiBaseUrl) || preset.defaultBaseUrl || "",
+    model: trimValue(input?.model) || trimValue(input?.openaiModel) || preset.defaultModel || "",
+    anthropicVersion: trimValue(input?.anthropicVersion) || "2023-06-01",
+    googleApiVersion: trimValue(input?.googleApiVersion) || "v1beta",
   };
 }
 

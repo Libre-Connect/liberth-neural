@@ -12,17 +12,125 @@ export type RoleDefinitionInput = {
   language: string;
 };
 
-export type ProviderMode = "glm-main" | "openai-compatible";
+export type ProviderMode =
+  | "glm-main"
+  | "openai-compatible"
+  | "openrouter"
+  | "deepseek"
+  | "siliconflow"
+  | "groq"
+  | "ollama"
+  | "anthropic"
+  | "google-gemini";
 
 export type GenerationMode = "llm" | "persona-engine" | "fallback";
 
 export type ProviderSettings = {
   providerMode: ProviderMode;
   glmModel: string;
-  openaiApiKey: string;
-  openaiBaseUrl: string;
-  openaiModel: string;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  anthropicVersion: string;
+  googleApiVersion: string;
 };
+
+export type ProviderCatalogItem = {
+  id: ProviderMode;
+  label: string;
+  description: string;
+  apiStyle: "glm-main" | "openai-compatible" | "anthropic" | "google-gemini";
+  defaultModel: string;
+  defaultBaseUrl?: string;
+  apiKeyPlaceholder: string;
+};
+
+export const providerCatalog: ProviderCatalogItem[] = [
+  {
+    id: "glm-main",
+    label: "GLM",
+    description: "Native Zhipu GLM access for the built-in neural dialogue path.",
+    apiStyle: "glm-main",
+    defaultModel: "glm-4-flash-250414",
+    apiKeyPlaceholder: "ZHIPUAI_API_KEY / GLM_API_KEY",
+  },
+  {
+    id: "openai-compatible",
+    label: "OpenAI Compatible",
+    description: "Any provider that exposes the OpenAI chat completions format.",
+    apiStyle: "openai-compatible",
+    defaultModel: "gpt-4.1-mini",
+    defaultBaseUrl: "https://api.openai.com/v1",
+    apiKeyPlaceholder: "OPENAI_API_KEY",
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    description: "Router for multiple frontier and open-weight chat models.",
+    apiStyle: "openai-compatible",
+    defaultModel: "openai/gpt-4.1-mini",
+    defaultBaseUrl: "https://openrouter.ai/api/v1",
+    apiKeyPlaceholder: "OPENROUTER_API_KEY",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    description: "Native DeepSeek hosted chat models through an OpenAI-compatible API.",
+    apiStyle: "openai-compatible",
+    defaultModel: "deepseek-chat",
+    defaultBaseUrl: "https://api.deepseek.com/v1",
+    apiKeyPlaceholder: "DEEPSEEK_API_KEY",
+  },
+  {
+    id: "siliconflow",
+    label: "SiliconFlow",
+    description: "Hosted open-weight inference with an OpenAI-compatible surface.",
+    apiStyle: "openai-compatible",
+    defaultModel: "Qwen/Qwen2.5-72B-Instruct",
+    defaultBaseUrl: "https://api.siliconflow.cn/v1",
+    apiKeyPlaceholder: "SILICONFLOW_API_KEY",
+  },
+  {
+    id: "groq",
+    label: "Groq",
+    description: "Low-latency chat inference via Groq's OpenAI-compatible endpoint.",
+    apiStyle: "openai-compatible",
+    defaultModel: "llama-3.3-70b-versatile",
+    defaultBaseUrl: "https://api.groq.com/openai/v1",
+    apiKeyPlaceholder: "GROQ_API_KEY",
+  },
+  {
+    id: "ollama",
+    label: "Ollama",
+    description: "Run the neural character stack against a local model on your machine.",
+    apiStyle: "openai-compatible",
+    defaultModel: "qwen2.5:14b",
+    defaultBaseUrl: "http://localhost:11434/v1",
+    apiKeyPlaceholder: "Optional for reverse proxies",
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic",
+    description: "Native Anthropic Messages API support for Claude models.",
+    apiStyle: "anthropic",
+    defaultModel: "claude-3-5-haiku-latest",
+    defaultBaseUrl: "https://api.anthropic.com/v1",
+    apiKeyPlaceholder: "ANTHROPIC_API_KEY",
+  },
+  {
+    id: "google-gemini",
+    label: "Google Gemini",
+    description: "Native Gemini generateContent support for Google's models.",
+    apiStyle: "google-gemini",
+    defaultModel: "gemini-2.0-flash",
+    defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    apiKeyPlaceholder: "GOOGLE_API_KEY / GEMINI_API_KEY",
+  },
+];
+
+export function getProviderCatalogItem(mode: ProviderMode) {
+  return providerCatalog.find((item) => item.id === mode) || providerCatalog[0];
+}
 
 export type RoleBundle = {
   agents: string;
@@ -239,6 +347,21 @@ export type GenerationTrace = {
   reason?: string;
 };
 
+export type NeuralRecord = {
+  recordedAt: number;
+  dominantRoute: NeuralRoute;
+  turnSummary: string;
+  broadcastSummary: string;
+  routeInspector: NeuralStateSnapshot["routeInspector"];
+  modulators: NeuralStateSnapshot["modulators"];
+  workspaceContents: NeuralStateSnapshot["workspaceContents"];
+  topNeurons: NeuralStateSnapshot["topNeurons"];
+  memoryDirective: NeuralStateSnapshot["memoryDirective"] & {
+    durableMemoryCandidate?: string | null;
+  };
+  provider: GenerationTrace;
+};
+
 export type RoleBlueprint = {
   summary: string;
   greeting: string;
@@ -271,6 +394,8 @@ export type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   createdAt: number;
+  generation?: GenerationTrace | null;
+  neuralRecord?: NeuralRecord | null;
 };
 
 export type ConversationRecord = {
@@ -303,10 +428,12 @@ export type DeploymentRecord = {
   sessionByConversation: Record<string, string>;
   telegram?: {
     botToken: string;
+    chatId: string;
     secretToken?: string;
   };
   slack?: {
     botToken: string;
+    channelId: string;
     signingSecret: string;
   };
   webhook?: {
@@ -396,3 +523,16 @@ export const emptyRoleDefinition = (): RoleDefinitionInput => ({
   greeting: "",
   language: "Chinese",
 });
+
+export const emptyProviderSettings = (): ProviderSettings => {
+  const preset = getProviderCatalogItem("glm-main");
+  return {
+    providerMode: "glm-main",
+    glmModel: preset.defaultModel,
+    apiKey: "",
+    baseUrl: "",
+    model: "",
+    anthropicVersion: "2023-06-01",
+    googleApiVersion: "v1beta",
+  };
+};
