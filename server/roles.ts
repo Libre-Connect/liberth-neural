@@ -316,21 +316,21 @@ export async function generateRoleReplyDetailed(input: {
     );
     if (language === "zh") {
       return [
-        "我会按当前神经元角色设定来回答。",
+        "实时模型这次没有返回结果，下面是本地降级回复，不是实际模型输出。",
         `你刚才的问题是：“${input.userMessage}”。`,
         historyTurns > 0
           ? `我已经接住这段对话里的最近 ${historyTurns} 轮上下文。`
           : "这是这段神经元对话的第一轮刺激。",
-        "如果你想改变人格、目标或边界，请回到角色工作台重新生成角色。",
+        "请重试一次，或者检查 Runtime 里的模型配置和网络状态。",
       ].join("\n");
     }
     return [
-      "I will answer through the current neural character definition.",
+      "The live model did not return a response for this turn, so this is a local fallback instead of an actual model reply.",
       `Your latest message was: "${input.userMessage}".`,
       historyTurns > 0
         ? `I am carrying the latest ${historyTurns} turns of local context into this reply.`
         : "This is the first stimulus in this neural conversation.",
-      "If you want to change the persona, goals, or boundaries, go back to the character builder and regenerate the role.",
+      "Retry the turn, or check the runtime model settings and network path.",
     ].join("\n");
   };
 

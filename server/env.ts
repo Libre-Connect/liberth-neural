@@ -47,3 +47,19 @@ for (const filePath of envFiles) {
     process.env[parsed.key] = parsed.value;
   }
 }
+
+const [nodeMajor = 0, nodeMinor = 0] = process.versions.node
+  .split(".")
+  .map((value) => Number.parseInt(value, 10));
+
+if (nodeMajor < 18 || (nodeMajor === 18 && nodeMinor < 18)) {
+  throw new Error(
+    `Liberth Neural requires Node 18.18+ or newer. Current runtime: ${process.version}.`,
+  );
+}
+
+if (typeof globalThis.fetch !== "function") {
+  throw new Error(
+    `Liberth Neural requires a Node runtime with global fetch support. Current runtime: ${process.version}.`,
+  );
+}

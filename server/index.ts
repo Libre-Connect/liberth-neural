@@ -20,6 +20,11 @@ import {
   deriveNeuralStateSnapshot,
 } from "./neural-engine";
 import {
+  appendGlobalMemory as appendGlobalMemoryRecord,
+  buildAssistantNeuralRecord as createAssistantNeuralRecord,
+  toThreadMemories as deriveThreadMemories,
+} from "./neural-memory";
+import {
   defaultProviderSettings,
   normalizeProviderSettings,
   randomId,
@@ -29,6 +34,8 @@ import {
   upsertCharacter,
   upsertConversation,
   upsertDeployment,
+  upsertMarketListing,
+  upsertWorkRun,
 } from "./store";
 import {
   createOrUpdateAutomation,
@@ -41,8 +48,8 @@ import {
   buildConversationHistory,
   compactConversationIfNeeded,
 } from "./conversation-compaction";
-import type { LlmRuntimeConfig } from "./llm";
-import { composeCharacterFromBrief, generateBlueprint } from "./roles";
+import { hasLlmAccess, type LlmRuntimeConfig } from "./llm";
+import { composeCharacterFromBrief } from "./roles";
 import {
   attachSkillToCharacter,
   detachSkillFromCharacter,
@@ -54,7 +61,12 @@ import {
   removeWorkspaceSkill,
   resolveCharacterSkills,
 } from "./skills";
-import { buildRuntimeSystemPrompt } from "./workspace";
+import {
+  buildGovernedBlueprint,
+  ensureGovernedCharacter,
+} from "./persona-governance";
+import { deriveUnifiedRuntimeDecision } from "./intent-router";
+import { executeUnifiedRuntime } from "./unified-runtime";
 import { clientDistPath } from "./project-paths";
 
 const app = express();
@@ -141,6 +153,16 @@ function publicProviderSettings(provider: ProviderSettings): ProviderSettings {
   return {
     ...provider,
     apiKey: "",
+  };
+}
+
+function providerSettingsPayload(provider: ProviderSettings, setupComplete = false) {
+  const configured = hasLlmAccess(providerToRuntimeConfig(provider));
+  return {
+    provider: publicProviderSettings(provider),
+    configured,
+    setupComplete,
+    requiresSetup: !setupComplete || !configured,
   };
 }
 
@@ -687,21 +709,13 @@ function appendGlobalMemory(
 }
 
 async function hydrateCharacter(character: CharacterRecord) {
-  const needsBlueprint =
-    !character.blueprint?.profile
-    || !character.blueprint?.neuralGraph
-    || !character.blueprint?.bundleFiles;
-  if (!needsBlueprint) {
-    return character;
+  const nextCharacter = await ensureGovernedCharacter(character);
+  const needsWriteback =
+    nextCharacter.blueprint !== character.blueprint
+    || nextCharacter.updatedAt !== character.updatedAt;
+  if (!needsWriteback) {
+    return nextCharacter;
   }
-  const blueprint = await generateBlueprint(character.definition);
-  const nextCharacter: CharacterRecord = {
-    ...character,
-    blueprint,
-    globalMemories: Array.isArray(character.globalMemories) ? character.globalMemories : [],
-    lastNeuralState: character.lastNeuralState || null,
-    updatedAt: Date.now(),
-  };
   await updateStore((store) => {
     upsertCharacter(store, nextCharacter);
   });
@@ -951,7 +965,12 @@ app.delete("/api/characters/:characterId/automations/:automationId", async (req,
 });
 
 app.get("/api/settings/provider", async (_req, res) => {
-  res.json({ provider: publicProviderSettings(await resolveProviderSettings()) });
+  const store = await readStore();
+  const provider = normalizeProviderSettings({
+    ...defaultProviderSettings(),
+    ...(store.settings?.provider || {}),
+  });
+  res.json(providerSettingsPayload(provider, Boolean(store.settings?.provider)));
 });
 
 app.get("/api/providers", async (_req, res) => {
@@ -969,14 +988,14 @@ app.put("/api/settings/provider", async (req, res) => {
     savedProvider = mergeProviderSettings(store.settings?.provider, provider);
     store.settings = { provider: savedProvider };
   });
-  res.json({ provider: publicProviderSettings(savedProvider) });
+  res.json(providerSettingsPayload(savedProvider, true));
 });
 
 app.post("/api/characters/generate", async (req, res) => {
   try {
     const definition = ensureRoleDefinition(req.body?.definition);
     validateDefinition(definition);
-    const blueprint = await generateBlueprint(definition);
+    const blueprint = await buildGovernedBlueprint(definition);
     res.json({ blueprint });
   } catch (error: any) {
     res.status(400).json({ message: String(error?.message || error) });
@@ -1004,7 +1023,7 @@ app.post("/api/characters", async (req, res) => {
   try {
     const definition = ensureRoleDefinition(req.body?.definition);
     validateDefinition(definition);
-    const blueprint = req.body?.blueprint || (await generateBlueprint(definition));
+    const blueprint = req.body?.blueprint || (await buildGovernedBlueprint(definition));
     const character: CharacterRecord = {
       id: randomId("char"),
       slug: slugify(definition.name) || randomId("neural"),
@@ -1039,7 +1058,7 @@ app.put("/api/characters", async (req, res) => {
       return res.status(404).json({ message: "Character not found" });
     }
 
-    const blueprint = req.body?.blueprint || (await generateBlueprint(definition));
+    const blueprint = req.body?.blueprint || (await buildGovernedBlueprint(definition));
     const character: CharacterRecord = {
       ...existing,
       slug: slugify(definition.name) || existing.slug,
@@ -1285,7 +1304,7 @@ app.post("/api/chat", async (req, res) => {
       instructions: command.type === "compact" ? command.instructions : undefined,
     });
     conversation = compactionResult.conversation;
-    const threadMemories = toThreadMemories(conversation);
+    const threadMemories = deriveThreadMemories(conversation);
     const globalMemories = Array.isArray(character.globalMemories) ? character.globalMemories : [];
     const neuralState = deriveNeuralStateSnapshot({
       actorType: "clone",
@@ -1320,6 +1339,8 @@ app.post("/api/chat", async (req, res) => {
       ok: boolean;
       summary: string;
     }> = [];
+    let workRun = null;
+    let marketListing = null;
 
     if (command.type === "compact") {
       const summary = String(conversation.compaction?.summary || "").trim();
@@ -1398,33 +1419,31 @@ app.post("/api/chat", async (req, res) => {
         ].join("\n");
         generation.reason = "missing_skill";
       } else {
-        const systemPrompt = [
-          await buildRuntimeSystemPrompt({
-            character: workingCharacter,
-            availableSkills,
-            attachedSkills,
-            activeSkill,
-          }),
-          buildNeuralRuntimeSection({
-            neuralState,
-            globalMemories,
-          }),
-        ]
-          .filter(Boolean)
-          .join("\n\n");
-
-        const runtimeResult = await runRoleAgentTurn({
+        const runtimeMessage = command.type === "use-skill" ? command.task : message;
+        const decision = deriveUnifiedRuntimeDecision({
+          message: runtimeMessage,
+          commandType: command.type,
+          neuralState,
+        });
+        const runtimeResult = await executeUnifiedRuntime({
           character: workingCharacter,
-          systemPrompt,
           history,
-          userMessage: command.type === "use-skill" ? command.task : message,
+          userMessage: runtimeMessage,
+          conversationId: conversation.id,
           config: providerConfig,
-          allowMutatingTools: true,
+          availableSkills,
+          attachedSkills,
+          activeSkill,
+          neuralState,
+          globalMemories,
+          decision,
         });
 
         assistantReply = runtimeResult.reply;
         generation = runtimeResult.generation;
         toolEvents = runtimeResult.toolEvents || [];
+        workRun = runtimeResult.workRun || null;
+        marketListing = runtimeResult.marketListing || null;
         workingCharacter = (await getCharacterById(character.id)) || workingCharacter;
       }
     }
@@ -1444,8 +1463,8 @@ app.post("/api/chat", async (req, res) => {
       content: assistantReply,
       createdAt: Date.now(),
       generation,
-      neuralRecord: buildAssistantNeuralRecord({
-        generation,
+      neuralRecord: createAssistantNeuralRecord({
+        provider: generation,
         neuralState,
         durableMemoryCandidate: durableMemory,
       }),
@@ -1465,7 +1484,7 @@ app.post("/api/chat", async (req, res) => {
       ...workingCharacter,
       updatedAt: Date.now(),
       lastNeuralState: neuralState as CharacterRecord["lastNeuralState"],
-      globalMemories: appendGlobalMemory(
+      globalMemories: appendGlobalMemoryRecord(
         Array.isArray(workingCharacter.globalMemories) ? workingCharacter.globalMemories : [],
         durableMemory,
         neuralState.dominantRoute,
@@ -1475,6 +1494,12 @@ app.post("/api/chat", async (req, res) => {
     await updateStore((store) => {
       upsertCharacter(store, nextCharacter);
       upsertConversation(store, nextConversation);
+      if (workRun) {
+        upsertWorkRun(store, workRun);
+      }
+      if (marketListing) {
+        upsertMarketListing(store, marketListing);
+      }
     });
 
     res.json({
@@ -1483,6 +1508,8 @@ app.post("/api/chat", async (req, res) => {
       neuralState,
       generation,
       toolEvents,
+      workRun,
+      marketListing,
     });
   } catch (error: any) {
     res.status(400).json({ message: String(error?.message || error) });

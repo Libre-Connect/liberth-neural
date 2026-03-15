@@ -34,6 +34,13 @@ type CharacterComposePayload = {
   blueprint: RoleBlueprint;
 };
 
+type ProviderSettingsPayload = {
+  provider: ProviderSettings;
+  configured: boolean;
+  setupComplete?: boolean;
+  requiresSetup: boolean;
+};
+
 type TelegramDraft = {
   id: string;
   botToken: string;
@@ -144,6 +151,49 @@ function providerFamilyLabel(mode: ProviderMode) {
   return "OpenAI-style";
 }
 
+function providerDisplayLabel(mode: ProviderMode) {
+  return getProviderCatalogItem(mode).label;
+}
+
+function providerConnectionLabel(mode: ProviderMode) {
+  return mode === "ollama" ? "Local" : "API key";
+}
+
+function providerNeedsApiKey(mode: ProviderMode) {
+  return mode !== "ollama";
+}
+
+function providerRuntimeModel(settings: ProviderSettings) {
+  if (settings.providerMode === "glm-main") {
+    return settings.glmModel || getProviderCatalogItem("glm-main").defaultModel;
+  }
+  return settings.model || getProviderCatalogItem(settings.providerMode).defaultModel;
+}
+
+function formatGenerationReason(reason?: string) {
+  const raw = String(reason || "").trim();
+  if (!raw) return "";
+  const normalized = raw.toLowerCase();
+
+  if (normalized.includes("no_llm_access")) {
+    return "No live model access is configured for the current runtime.";
+  }
+
+  if (normalized.includes("fetch failed")) {
+    return `The live model request failed before a reply was returned. ${raw}`;
+  }
+
+  if (normalized.includes("api key")) {
+    return `The selected runtime is missing a usable API key. ${raw}`;
+  }
+
+  if (normalized.includes("json_not_found")) {
+    return "The model replied, but the expected JSON payload was missing.";
+  }
+
+  return raw;
+}
+
 const providerSections: Array<{
   title: string;
   subtitle: string;
@@ -250,6 +300,7 @@ function downloadText(fileName: string, text: string, mimeType: string) {
 }
 
 export default function App() {
+  const [bootstrapped, setBootstrapped] = useState(false);
   const [appSection, setAppSection] = useState<AppSection>("characters");
   const [studioMode, setStudioMode] = useState<StudioMode>("create");
   const [characters, setCharacters] = useState<CharacterRecord[]>([]);
@@ -268,6 +319,9 @@ export default function App() {
   const [chatError, setChatError] = useState("");
   const [providerSettings, setProviderSettings] =
     useState<ProviderSettings>(emptyProviderSettings);
+  const [providerConfigured, setProviderConfigured] = useState(false);
+  const [providerSetupRequired, setProviderSetupRequired] = useState(true);
+  const [savedProviderMode, setSavedProviderMode] = useState<ProviderMode>("glm-main");
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [settingsSaved, setSettingsSaved] = useState("");
@@ -362,7 +416,15 @@ export default function App() {
   }, [displayedMessages.length, selectedCharacter, selectedConversationId]);
 
   async function bootstrap() {
-    await Promise.all([loadCharacters(), loadProviderSettings()]);
+    try {
+      await Promise.all([loadCharacters(), loadProviderSettings()]);
+    } catch (error: any) {
+      setSettingsError(String(error?.message || error));
+      setProviderSetupRequired(true);
+      setAppSection("settings");
+    } finally {
+      setBootstrapped(true);
+    }
   }
 
   async function loadCharacters(preferredCharacterId?: string) {
@@ -381,8 +443,11 @@ export default function App() {
   }
 
   async function loadProviderSettings() {
-    const payload = await requestJson<{ provider: ProviderSettings }>("/api/settings/provider");
+    const payload = await requestJson<ProviderSettingsPayload>("/api/settings/provider");
     setProviderSettings(payload.provider);
+    setProviderConfigured(payload.configured);
+    setProviderSetupRequired(payload.requiresSetup);
+    setSavedProviderMode(payload.provider.providerMode);
   }
 
   async function loadConversations(characterId: string) {
@@ -508,6 +573,11 @@ export default function App() {
   }
 
   function openChatForCharacter(character: CharacterRecord) {
+    if (providerSetupRequired) {
+      setAppSection("settings");
+      setSettingsError("Choose a provider and save a live model before opening chat.");
+      return;
+    }
     setSelectedCharacterId(character.id);
     setAppSection("chat");
     setChatError("");
@@ -866,11 +936,22 @@ export default function App() {
   }
 
   async function handleSaveProviderSettings() {
+    const switchingProvider = providerSettings.providerMode !== savedProviderMode;
+    if (
+      providerNeedsApiKey(providerSettings.providerMode)
+      && !providerSettings.apiKey.trim()
+      && (switchingProvider || !providerConfigured)
+    ) {
+      setSettingsError("Enter an API key before continuing.");
+      setSettingsSaved("");
+      return;
+    }
+
     setSettingsBusy(true);
     setSettingsError("");
     setSettingsSaved("");
     try {
-      const payload = await requestJson<{ provider: ProviderSettings }>(
+      const payload = await requestJson<ProviderSettingsPayload>(
         "/api/settings/provider",
         {
           method: "PUT",
@@ -878,7 +959,13 @@ export default function App() {
         },
       );
       setProviderSettings(payload.provider);
+      setProviderConfigured(payload.configured);
+      setProviderSetupRequired(payload.requiresSetup);
+      setSavedProviderMode(payload.provider.providerMode);
       setSettingsSaved("Runtime settings saved.");
+      if (!payload.requiresSetup && providerSetupRequired) {
+        setAppSection("characters");
+      }
     } catch (error: any) {
       setSettingsError(String(error?.message || error));
     } finally {
@@ -1522,6 +1609,11 @@ export default function App() {
                     {" · "}
                     {selectedCharacter.definition.oneLiner}
                   </p>
+                  <div className="chat-topbar-status">
+                    <span className="meta-pill">{providerDisplayLabel(providerSettings.providerMode)}</span>
+                    <span className="meta-pill">{providerRuntimeModel(providerSettings)}</span>
+                    <span className="meta-pill">{providerFamilyLabel(providerSettings.providerMode)}</span>
+                  </div>
                 </div>
 
                 <div className="actions chat-topbar-actions">
@@ -1917,6 +2009,36 @@ export default function App() {
                     <div className="message-copy">
                       <p>{message.content}</p>
                     </div>
+                    {message.role === "assistant" && message.generation ? (
+                      <>
+                        <div className="message-trace">
+                          <span
+                            className={`meta-pill ${
+                              message.generation.mode === "llm"
+                                ? "meta-pill-success"
+                                : "meta-pill-warning"
+                            }`}
+                          >
+                            {message.generation.mode === "llm" ? "Live model" : "Fallback"}
+                          </span>
+                          <span className="meta-pill">
+                            {providerDisplayLabel(message.generation.providerMode)}
+                          </span>
+                          <span className="meta-pill">{message.generation.model}</span>
+                          {message.generation.totalTokens ? (
+                            <span className="meta-pill">{message.generation.totalTokens} tokens</span>
+                          ) : null}
+                          {message.generation.nativeTools ? (
+                            <span className="meta-pill">Native tools</span>
+                          ) : null}
+                        </div>
+                        {message.generation.mode === "fallback" && message.generation.reason ? (
+                          <p className="message-warning">
+                            {formatGenerationReason(message.generation.reason)}
+                          </p>
+                        ) : null}
+                      </>
+                    ) : null}
                     {message.role === "assistant" && Array.isArray(message.toolEvents)
                       ? renderToolEvents(message.toolEvents)
                       : null}
@@ -1974,6 +2096,161 @@ export default function App() {
             </section>
           )}
         </main>
+      </div>
+    );
+  }
+
+  function renderProviderSelection() {
+    return (
+      <aside className="settings-provider-nav">
+        {providerSections.map((section) => (
+          <section key={section.title} className="settings-provider-group">
+            <div className="settings-provider-group-head">
+              <p className="eyebrow">{section.title}</p>
+            </div>
+
+            <div className="settings-provider-group-list">
+              {section.modes.map((mode) => {
+                const item = getProviderCatalogItem(mode);
+                const active = providerSettings.providerMode === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    className={`settings-provider-button ${active ? "active" : ""}`}
+                    type="button"
+                    onClick={() => updateProviderMode(item.id)}
+                  >
+                    <span className="settings-provider-mark">{providerMonogram(item.id)}</span>
+                    <span className="settings-provider-copy">
+                      <span className="settings-provider-topline">
+                        <strong>{item.label}</strong>
+                        <span className="settings-provider-family">
+                          {providerConnectionLabel(item.id)}
+                        </span>
+                      </span>
+                    </span>
+                    {active ? <span className="settings-provider-state">Selected</span> : null}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        ))}
+      </aside>
+    );
+  }
+
+  function renderProviderForm(setupMode = false) {
+    return (
+      <div className={`settings-provider-form ${setupMode ? "setup-mode" : ""}`}>
+        <div className="settings-provider-summary">
+          <p className="eyebrow">{setupMode ? "Step 2" : "Selected provider"}</p>
+          <h3>{activeProviderPreset.label}</h3>
+          <p className="small-note">
+            {providerNeedsApiKey(providerSettings.providerMode)
+              ? "Paste an API key, then save."
+              : "Use your local Ollama runtime, then save."}
+          </p>
+        </div>
+
+        <div className="form-stack">
+          {providerNeedsApiKey(providerSettings.providerMode) ? (
+            <label>
+              <span>API key</span>
+              <input
+                type="password"
+                placeholder={activeProviderPreset.apiKeyPlaceholder}
+                value={providerSettings.apiKey}
+                onChange={(event) => updateProviderField("apiKey", event.target.value)}
+              />
+            </label>
+          ) : null}
+
+          {providerSettings.providerMode === "glm-main" ? (
+            <label>
+              <span>GLM model</span>
+              <input
+                value={providerSettings.glmModel}
+                onChange={(event) => updateProviderField("glmModel", event.target.value)}
+              />
+            </label>
+          ) : (
+            <>
+              <label>
+                <span>Base URL</span>
+                <input
+                  value={providerSettings.baseUrl}
+                  onChange={(event) => updateProviderField("baseUrl", event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Model</span>
+                <input
+                  value={providerSettings.model}
+                  onChange={(event) => updateProviderField("model", event.target.value)}
+                />
+              </label>
+              {providerSettings.providerMode === "anthropic" ? (
+                <label>
+                  <span>Anthropic version</span>
+                  <input
+                    value={providerSettings.anthropicVersion}
+                    onChange={(event) =>
+                      updateProviderField("anthropicVersion", event.target.value)}
+                  />
+                </label>
+              ) : null}
+              {providerSettings.providerMode === "google-gemini" ? (
+                <label>
+                  <span>Google API version</span>
+                  <input
+                    value={providerSettings.googleApiVersion}
+                    onChange={(event) =>
+                      updateProviderField("googleApiVersion", event.target.value)}
+                  />
+                </label>
+              ) : null}
+            </>
+          )}
+        </div>
+
+        <div className="actions">
+          <button
+            className="primary-button wide"
+            type="button"
+            onClick={handleSaveProviderSettings}
+            disabled={settingsBusy}
+          >
+            {settingsBusy ? "Saving..." : setupMode ? "Save and continue" : "Save runtime"}
+          </button>
+        </div>
+
+        {!setupMode ? (
+          <p className="small-note">
+            Leave the API key blank to keep the stored key for the current provider.
+          </p>
+        ) : null}
+        {settingsError ? <p className="error-banner">{settingsError}</p> : null}
+        {settingsSaved ? <p className="success-banner">{settingsSaved}</p> : null}
+      </div>
+    );
+  }
+
+  function renderProviderSetupGate() {
+    return (
+      <div className="setup-gate">
+        <section className="panel setup-gate-panel">
+          <div className="setup-gate-copy">
+            <p className="eyebrow">Runtime setup</p>
+            <h1>Connect a model first</h1>
+            <p>Pick one provider, enter the required value, and save.</p>
+          </div>
+
+          <div className="settings-runtime-shell setup-runtime-shell">
+            {renderProviderSelection()}
+            {renderProviderForm(true)}
+          </div>
+        </section>
       </div>
     );
   }
@@ -2143,8 +2420,7 @@ export default function App() {
             </div>
           </div>
           <p className="small-note">
-            Runtime configuration lives here now, separate from role creation and chat. API keys
-            remain write-only.
+            Choose one provider, fill the required fields, then save.
           </p>
         </section>
 
@@ -2158,134 +2434,9 @@ export default function App() {
             </div>
 
             <div className="settings-runtime-shell">
-              <aside className="settings-provider-nav">
-                {providerSections.map((section) => (
-                  <section key={section.title} className="settings-provider-group">
-                    <div className="settings-provider-group-head">
-                      <p className="eyebrow">{section.title}</p>
-                      <p className="small-note">{section.subtitle}</p>
-                    </div>
-
-                    <div className="settings-provider-group-list">
-                      {section.modes.map((mode) => {
-                        const item = getProviderCatalogItem(mode);
-                        const active = providerSettings.providerMode === item.id;
-                        return (
-                          <button
-                            key={item.id}
-                            className={`settings-provider-button ${active ? "active" : ""}`}
-                            type="button"
-                            onClick={() => updateProviderMode(item.id)}
-                          >
-                            <span className="settings-provider-mark">
-                              {providerMonogram(item.id)}
-                            </span>
-                            <span className="settings-provider-copy">
-                              <span className="settings-provider-topline">
-                                <strong>{item.label}</strong>
-                                <span className="settings-provider-family">
-                                  {providerFamilyLabel(item.id)}
-                                </span>
-                              </span>
-                              <span>{item.description}</span>
-                            </span>
-                            {active ? (
-                              <span className="settings-provider-state">Selected</span>
-                            ) : null}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </section>
-                ))}
-              </aside>
-
-              <div className="settings-provider-form">
-                <div className="settings-provider-summary">
-                  <p className="eyebrow">Selected provider</p>
-                  <h3>{activeProviderPreset.label}</h3>
-                  <p className="small-note">{activeProviderPreset.description}</p>
-                </div>
-
-                <div className="form-stack">
-                  {providerSettings.providerMode !== "ollama" ? (
-                    <label>
-                      <span>API key</span>
-                      <input
-                        type="password"
-                        placeholder={activeProviderPreset.apiKeyPlaceholder}
-                        value={providerSettings.apiKey}
-                        onChange={(event) => updateProviderField("apiKey", event.target.value)}
-                      />
-                    </label>
-                  ) : null}
-
-                  {providerSettings.providerMode === "glm-main" ? (
-                    <label>
-                      <span>GLM model</span>
-                      <input
-                        value={providerSettings.glmModel}
-                        onChange={(event) => updateProviderField("glmModel", event.target.value)}
-                      />
-                    </label>
-                  ) : (
-                    <>
-                      <label>
-                        <span>Base URL</span>
-                        <input
-                          value={providerSettings.baseUrl}
-                          onChange={(event) => updateProviderField("baseUrl", event.target.value)}
-                        />
-                      </label>
-                      <label>
-                        <span>Model</span>
-                        <input
-                          value={providerSettings.model}
-                          onChange={(event) => updateProviderField("model", event.target.value)}
-                        />
-                      </label>
-                      {providerSettings.providerMode === "anthropic" ? (
-                        <label>
-                          <span>Anthropic version</span>
-                          <input
-                            value={providerSettings.anthropicVersion}
-                            onChange={(event) =>
-                              updateProviderField("anthropicVersion", event.target.value)}
-                          />
-                        </label>
-                      ) : null}
-                      {providerSettings.providerMode === "google-gemini" ? (
-                        <label>
-                          <span>Google API version</span>
-                          <input
-                            value={providerSettings.googleApiVersion}
-                            onChange={(event) =>
-                              updateProviderField("googleApiVersion", event.target.value)}
-                          />
-                        </label>
-                      ) : null}
-                    </>
-                  )}
-                </div>
-              </div>
+              {renderProviderSelection()}
+              {renderProviderForm()}
             </div>
-
-            <div className="actions">
-              <button
-                className="primary-button wide"
-                type="button"
-                onClick={handleSaveProviderSettings}
-                disabled={settingsBusy}
-              >
-                {settingsBusy ? "Saving..." : "Save runtime"}
-              </button>
-            </div>
-
-            <p className="small-note">
-              Leave the API key blank to keep the stored key for the current provider.
-            </p>
-            {settingsError ? <p className="error-banner">{settingsError}</p> : null}
-            {settingsSaved ? <p className="success-banner">{settingsSaved}</p> : null}
           </section>
 
           <section className="panel">
@@ -2302,6 +2453,23 @@ export default function App() {
         </div>
       </>
     );
+  }
+
+  if (!bootstrapped) {
+    return (
+      <div className="setup-gate">
+        <section className="panel setup-gate-panel loading">
+          <div className="setup-gate-copy">
+            <p className="eyebrow">Liberth</p>
+            <h1>Loading runtime</h1>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  if (providerSetupRequired) {
+    return renderProviderSetupGate();
   }
 
   if (appSection === "chat") {
@@ -2339,7 +2507,7 @@ export default function App() {
               className="nav-button"
               type="button"
               onClick={() => setAppSection("chat")}
-              disabled={!selectedCharacter}
+              disabled={!selectedCharacter || providerSetupRequired}
             >
               Chat
             </button>
@@ -2388,6 +2556,7 @@ export default function App() {
                   className="primary-button"
                   type="button"
                   onClick={() => openChatForCharacter(selectedCharacter)}
+                  disabled={providerSetupRequired}
                 >
                   Open chat
                 </button>
@@ -2428,6 +2597,7 @@ export default function App() {
                       className="primary-button"
                       type="button"
                       onClick={() => openChatForCharacter(character)}
+                      disabled={providerSetupRequired}
                     >
                       Chat
                     </button>

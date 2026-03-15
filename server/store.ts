@@ -8,8 +8,10 @@ import type {
   ConversationRecord,
   DeploymentRecord,
   InstalledSkillRecord,
+  MarketListingRecord,
   ProviderSettings,
   StoreShape,
+  WorkRunRecord,
 } from "../src/types";
 import { getProviderCatalogItem } from "../src/types";
 import { storeFilePath } from "./project-paths";
@@ -74,6 +76,8 @@ const defaultStore: StoreShape = {
   installedSkills: [],
   automations: [],
   automationRuns: [],
+  workRuns: [],
+  marketListings: [],
   settings: {
     provider: defaultProviderSettings(),
   },
@@ -150,6 +154,81 @@ export async function readStore(): Promise<StoreShape> {
         }))
       : [];
 
+    const workRuns = Array.isArray(parsed.workRuns)
+      ? parsed.workRuns.map((item) => ({
+          ...item,
+          title: String(item.title || "").trim(),
+          summary: String(item.summary || "").trim(),
+          objective: String(item.objective || "").trim(),
+          userMessage: String(item.userMessage || "").trim(),
+          taskType:
+            item.taskType === "spec" || item.taskType === "delivery"
+              ? item.taskType
+              : ("analysis" as const),
+          executionPath:
+            item.executionPath === "planned_runtime" || item.executionPath === "grouped_work"
+              ? item.executionPath
+              : ("direct_runtime" as const),
+          status:
+            item.status === "queued"
+              || item.status === "running"
+              || item.status === "completed"
+              || item.status === "failed"
+              ? item.status
+              : ("queued" as const),
+          qaStatus:
+            item.qaStatus === "passed" || item.qaStatus === "failed"
+              ? item.qaStatus
+              : ("pending" as const),
+          publicationCandidate: item.publicationCandidate === true,
+          stageNotes: Array.isArray(item.stageNotes)
+            ? item.stageNotes.map((note) => String(note || "").trim()).filter(Boolean)
+            : [],
+          artifacts: Array.isArray(item.artifacts)
+            ? item.artifacts.map((artifact) => ({
+                ...artifact,
+                title: String(artifact.title || "").trim(),
+                content: String(artifact.content || ""),
+                kind:
+                  artifact.kind === "plan"
+                  || artifact.kind === "delivery"
+                  || artifact.kind === "qa"
+                  || artifact.kind === "repair"
+                  || artifact.kind === "publication"
+                    ? artifact.kind
+                    : ("brief" as const),
+                status:
+                  artifact.status === "accepted" || artifact.status === "rejected"
+                    ? artifact.status
+                    : ("created" as const),
+                notes: Array.isArray(artifact.notes)
+                  ? artifact.notes.map((note) => String(note || "").trim()).filter(Boolean)
+                  : undefined,
+              }))
+            : [],
+        }))
+      : [];
+
+    const marketListings = Array.isArray(parsed.marketListings)
+      ? parsed.marketListings.map((item) => ({
+          ...item,
+          title: String(item.title || "").trim(),
+          summary: String(item.summary || "").trim(),
+          artifactKind:
+            item.artifactKind === "plan"
+            || item.artifactKind === "delivery"
+            || item.artifactKind === "qa"
+            || item.artifactKind === "repair"
+            || item.artifactKind === "publication"
+              ? item.artifactKind
+              : ("brief" as const),
+          status: item.status === "published" ? "published" : "draft",
+          tags: Array.isArray(item.tags)
+            ? item.tags.map((tag) => String(tag || "").trim()).filter(Boolean)
+            : [],
+        }))
+      : [];
+
     return {
       ...defaultStore,
       ...parsed,
@@ -158,6 +237,8 @@ export async function readStore(): Promise<StoreShape> {
       installedSkills,
       automations,
       automationRuns,
+      workRuns,
+      marketListings,
       settings: {
         provider: normalizeProviderSettings(parsed.settings?.provider || {}),
       },
@@ -243,4 +324,24 @@ export function upsertAutomation(store: StoreShape, automation: AutomationRecord
 export function appendAutomationRun(store: StoreShape, run: AutomationRunRecord) {
   store.automationRuns.unshift(run);
   store.automationRuns = store.automationRuns.slice(0, 120);
+}
+
+export function upsertWorkRun(store: StoreShape, workRun: WorkRunRecord) {
+  const index = store.workRuns.findIndex((item) => item.id === workRun.id);
+  if (index >= 0) {
+    store.workRuns[index] = workRun;
+    return;
+  }
+  store.workRuns.unshift(workRun);
+  store.workRuns = store.workRuns.slice(0, 120);
+}
+
+export function upsertMarketListing(store: StoreShape, listing: MarketListingRecord) {
+  const index = store.marketListings.findIndex((item) => item.id === listing.id);
+  if (index >= 0) {
+    store.marketListings[index] = listing;
+    return;
+  }
+  store.marketListings.unshift(listing);
+  store.marketListings = store.marketListings.slice(0, 120);
 }

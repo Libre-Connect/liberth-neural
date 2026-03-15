@@ -452,12 +452,16 @@ button:disabled {
 .chat-app-shell {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   background: #f7f7f8;
 }
 
 .chat-app-sidebar {
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -610,7 +614,9 @@ button:disabled {
 
 .chat-app-main {
   min-width: 0;
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   background: #ffffff;
@@ -632,6 +638,9 @@ button:disabled {
 
 .chat-topbar-copy {
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .chat-topbar-copy h2 {
@@ -641,10 +650,16 @@ button:disabled {
 }
 
 .chat-topbar-copy p {
-  margin: 4px 0 0;
+  margin: 0;
   color: #6a655f;
   line-height: 1.45;
   font-size: 13px;
+}
+
+.chat-topbar-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .chat-topbar-actions {
@@ -833,6 +848,7 @@ button:disabled {
   max-height: none;
   padding: 28px 24px 20px;
   gap: 22px;
+  align-items: center;
   background: #ffffff;
 }
 
@@ -877,6 +893,24 @@ button:disabled {
   font-size: 15px;
   line-height: 1.75;
   color: #1f1f1d;
+}
+
+.message-trace {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.message-warning {
+  margin: -4px 0 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(172, 97, 34, 0.18);
+  border-radius: 14px;
+  background: rgba(255, 243, 227, 0.92);
+  color: #8f541f;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .chat-thread .neural-record {
@@ -950,7 +984,9 @@ button:disabled {
 }
 
 .chat-composer-shell {
+  flex: 0 0 auto;
   padding: 16px 24px 24px;
+  border-top: 1px solid rgba(32, 26, 20, 0.06);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, #ffffff 24%);
 }
 
@@ -1046,11 +1082,11 @@ button:disabled {
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.78);
-  padding: 14px;
+  padding: 12px 14px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 12px;
-  align-items: start;
+  align-items: center;
   text-align: left;
   position: relative;
 }
@@ -1097,7 +1133,7 @@ button:disabled {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .settings-provider-topline {
@@ -1148,6 +1184,10 @@ button:disabled {
   padding: 16px;
 }
 
+.settings-provider-form.setup-mode {
+  padding: 18px;
+}
+
 .settings-provider-summary {
   display: flex;
   flex-direction: column;
@@ -1158,6 +1198,50 @@ button:disabled {
 .settings-provider-summary h3 {
   margin: 0;
   font-size: 1.1rem;
+}
+
+.setup-gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background:
+    radial-gradient(circle at top left, rgba(31, 96, 84, 0.08), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(183, 112, 50, 0.08), transparent 30%),
+    #f7f4ef;
+}
+
+.setup-gate-panel {
+  width: min(1040px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.setup-gate-panel.loading {
+  width: min(520px, 100%);
+}
+
+.setup-gate-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.setup-gate-copy h1 {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 3rem);
+  letter-spacing: -0.04em;
+}
+
+.setup-gate-copy p {
+  margin: 0;
+  color: var(--ink-soft);
+  max-width: 36ch;
+}
+
+.setup-runtime-shell {
+  padding-top: 4px;
 }
 
 .advanced-editor {
@@ -1543,6 +1627,16 @@ button:disabled {
   color: #8e531f;
 }
 
+.meta-pill-success {
+  background: rgba(36, 107, 61, 0.12);
+  color: #246b3d;
+}
+
+.meta-pill-warning {
+  background: rgba(172, 97, 34, 0.14);
+  color: #8f541f;
+}
+
 .tag {
   background: var(--accent-warm-soft);
   color: #8e531f;
@@ -1707,6 +1801,8 @@ button:disabled {
 
   .chat-app-shell {
     grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
   }
 
   .sidebar {
@@ -1733,9 +1829,20 @@ button:disabled {
   }
 
   .chat-app-sidebar {
+    height: auto;
     min-height: auto;
+    overflow: visible;
     border-right: 0;
     border-bottom: 1px solid rgba(32, 26, 20, 0.08);
+  }
+
+  .chat-app-main {
+    height: auto;
+    overflow: visible;
+  }
+
+  .setup-gate {
+    padding: 18px;
   }
 
   .chat-app-history {

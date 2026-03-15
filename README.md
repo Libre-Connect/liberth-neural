@@ -8,6 +8,12 @@ role-defined dialogue systems. It studies how you can turn a plain-language
 character definition into a structured runtime made of a persona profile, a
 neural graph, a prompt bundle, a memory layer, and a per-turn neural trace.
 
+The current standalone now applies Liberth's unified neural runtime model. The
+runtime is split into persona governance, neural memory, intent routing, and
+three execution paths: direct runtime, planned runtime, and grouped work. That
+lets you study the dialogue core as a compact architecture seam instead of a
+single monolithic chat loop.
+
 > **Note:** This is a preview feature currently under active development.
 
 This repository is intentionally narrow. It does not try to solve general
@@ -108,63 +114,77 @@ first-class records.
 
 ## How it works
 
-Liberth Neural runs in two phases: it first compiles a role definition into a
-stable runtime blueprint, then it executes that blueprint on every user turn.
-The system does not "become" a character through hidden training. It keeps a
-plain chain of transformations that you can inspect.
+Liberth Neural now runs as a unified runtime rather than a single chat loop.
+It still starts by compiling a role definition into a stable blueprint, but it
+then routes each turn through a governance layer, a neural memory layer, an
+intent router, and one of three execution paths.
 
 At a high level, the runtime works like this:
 
 1. You define a character in plain language through fields such as identity,
    tone, goals, boundaries, and knowledge.
-2. The compiler turns that definition into a `RoleBlueprint` made of a persona
-   profile, a neural graph, bundle files, and an initial system prompt.
-3. When a user sends a message, the runtime combines the blueprint with recent
-   thread memory and character-level global memory.
-4. The neural engine derives a `NeuralStateSnapshot` for that turn. This is
-   where route weights, modulators, active workspace contents, top neurons, and
-   memory directives are decided.
-5. The runtime rebuilds the system prompt from the blueprint plus the current
-   neural state, then sends that prompt and short history to the selected model
-   provider.
-6. After the model returns a reply, the server attaches a `NeuralRecord` that
-   explains what happened on that turn, including the dominant route and memory
-   decision.
-7. If the turn produces a durable memory candidate, the runtime writes it back
-   to the local character store for future turns.
+2. The governance layer compiles or repairs the character blueprint so the
+   runtime always has a usable persona profile, neural graph, and bundle.
+3. When a user sends a message, the runtime derives thread memories and global
+   memories, then uses them to build a `NeuralStateSnapshot`.
+4. The intent router converts that neural state and the current message into a
+   `RuntimeIntentDecision`.
+5. The unified runtime chooses one of three paths:
+   - `direct_runtime` for normal single-turn execution
+   - `planned_runtime` for reflective or learning-heavy execution
+   - `grouped_work` for multi-stage work that needs planning, delivery, QA,
+     and optional publication
+6. The selected path builds the runtime prompt, calls the provider adapter,
+   and returns a reply plus an explicit provider trace.
+7. The runtime then writes back a public `NeuralRecord`, an optional durable
+   memory candidate, and, for grouped work, a `WorkRunRecord` plus an optional
+   `MarketListingRecord`.
 
-The practical effect is that one assistant message is never treated as an
-isolated completion. It is the output of a repeatable loop: definition,
-compilation, state derivation, generation, trace attachment, and memory
-writeback.
+The practical effect is that one assistant message is no longer treated as a
+raw completion. It is the output of a repeatable pipeline: definition,
+governance, state derivation, path selection, execution, trace attachment, and
+local writeback.
 
 ## System boundary
 
-You can think of the project as four coupled layers. Each layer exists so the
-runtime can move from a text-defined role to an auditable assistant turn.
+You can think of the project as a single-node runtime with explicit internal
+subsystems. Each subsystem exists to keep the dialogue core inspectable even
+when a request expands beyond a normal answer.
 
 ```mermaid
 flowchart LR
-  A["Role definition"] --> B["Blueprint compiler"]
-  B --> C["Persona profile"]
-  B --> D["Neural graph"]
-  B --> E["Prompt bundle"]
-  C --> F["Neural runtime"]
-  D --> F
-  E --> F
-  F --> G["Provider adapter"]
-  G --> H["Assistant reply"]
-  F --> I["Neural record"]
-  F --> J["Durable memory candidate"]
-  I --> K["Conversation store"]
-  J --> L["Character store"]
+  A["Role definition"] --> B["Persona governance"]
+  B --> C["Blueprint compiler"]
+  C --> D["Persona profile"]
+  C --> E["Neural graph"]
+  C --> F["Prompt bundle"]
+  D --> G["Neural memory"]
+  E --> H["State derivation"]
+  F --> I["Unified runtime"]
+  G --> H
+  H --> J["Intent router"]
+  J --> K["Direct runtime"]
+  J --> L["Planned runtime"]
+  J --> M["Grouped work orchestrator"]
+  K --> N["Provider adapter"]
+  L --> N
+  M --> N
+  M --> O["Work run artifacts"]
+  M --> P["Draft publication"]
+  N --> Q["Assistant reply"]
+  H --> R["Neural record"]
+  R --> S["Conversation store"]
+  O --> S
+  P --> S
 ```
 
 Within that boundary, the repository currently includes:
 
-- a local blueprint compiler
-- a route-based dialogue runtime
-- a local persistence layer for characters and conversations
+- a local blueprint compiler and persona governance seam
+- a neural memory layer for thread and durable memory handling
+- a unified runtime with direct, planned, and grouped-work execution
+- a local persistence layer for characters, conversations, work runs, and
+  draft market listings
 - a provider abstraction over native and OpenAI-compatible APIs
 - a browser workspace for editing, chatting, and replaying neural records
 
@@ -173,9 +193,9 @@ Outside that boundary, the repository explicitly avoids:
 - voice impersonation
 - avatar impersonation
 - scraped identity reconstruction
-- autonomous tool execution loops
 - distributed memory infrastructure
 - high-scale serving guarantees
+- production-grade autonomous agent fleets
 
 ## Core artifacts
 
@@ -188,8 +208,11 @@ interface rather than as incidental app state.
 | `PersonaExtractProfile` | Structured identity, values, expertise, and style | [`server/neural-engine.ts`](./server/neural-engine.ts) |
 | `NeuralBundleGraph` | Regions, neurons, circuits, synapses, and plasticity settings | [`src/types.ts`](./src/types.ts) |
 | `RoleBlueprint` | Compiled output that packages profile, graph, bundle files, and system prompt | [`server/roles.ts`](./server/roles.ts) |
-| `NeuralStateSnapshot` | Turn-level derived state for one user message | [`server/neural-engine.ts`](./server/neural-engine.ts) |
-| `NeuralRecord` | Public trace attached to an assistant turn | [`server/index.ts`](./server/index.ts) |
+| `NeuralStateSnapshot` | Turn-level neural state derived from the current message and local memory | [`server/neural-engine.ts`](./server/neural-engine.ts) |
+| `RuntimeIntentDecision` | Execution-path decision that maps a turn into direct, planned, or grouped work | [`src/types.ts`](./src/types.ts) |
+| `NeuralRecord` | Public trace attached to an assistant turn | [`server/neural-memory.ts`](./server/neural-memory.ts) |
+| `WorkRunRecord` | Persisted record of grouped planning, delivery, QA, and repair artifacts | [`src/types.ts`](./src/types.ts) |
+| `MarketListingRecord` | Draft publication artifact created from reusable grouped work | [`src/types.ts`](./src/types.ts) |
 
 Those artifacts are the real product of the system. The chat reply is only one
 projection of them.
@@ -216,51 +239,65 @@ remote builder model to produce the baseline blueprint.
 ## Runtime loop
 
 The runtime loop is the core research object in this repository. For each user
-message, the system derives state first, then generates text, then decides what
-to persist.
+message, the system derives state first, then selects an execution path, then
+generates text, then decides what to persist.
 
 ```mermaid
 sequenceDiagram
   participant U as User
-  participant R as Runtime
+  participant G as Persona governance
+  participant M as Neural memory
+  participant S as State derivation
+  participant I as Intent router
+  participant R as Unified runtime
   participant P as Provider
-  participant S as Store
+  participant W as Work bridge
+  participant D as Local store
 
-  U->>R: Send message
-  R->>R: Derive NeuralStateSnapshot
-  R->>R: Build runtime system prompt
-  R->>P: Generate assistant reply
-  P-->>R: Reply + provider trace
-  R->>R: Build NeuralRecord
-  R->>R: Derive durable memory candidate
-  R->>S: Persist conversation and character state
+  U->>G: Submit message against character
+  G->>M: Ensure governed blueprint and load memory context
+  M->>S: Build thread + global memory inputs
+  S->>I: Derive NeuralStateSnapshot
+  I->>R: Emit RuntimeIntentDecision
+  alt Direct or planned runtime
+    R->>P: Generate assistant reply
+    P-->>R: Reply + provider trace
+  else Grouped work
+    R->>W: Open grouped work run
+    W->>P: Planning and delivery stages
+    P-->>W: Stage replies
+    W->>W: Run QA and optional repair
+    W-->>R: Final artifact + optional draft listing
+  end
+  R->>D: Persist conversation, neural record, memory, and optional work artifacts
   R-->>U: Reply + inspectable trace
 ```
 
-In concrete terms, the loop in [`POST /api/chat`](./server/index.ts) does the
-following:
+In concrete terms, the runtime entry in [`server/index.ts`](./server/index.ts)
+does the following:
 
 1. Load the selected character and latest conversation.
-2. Convert recent messages into thread memories.
-3. Combine thread memories, global memories, persona profile, and neural graph
-   into a `NeuralStateSnapshot`.
-4. Build a runtime system prompt from bundle files and the current neural
-   state.
-5. Call the selected provider adapter.
-6. Attach a compact `NeuralRecord` to the assistant message.
-7. Optionally consolidate a durable memory candidate into character memory.
+2. Repair or reuse the governed blueprint for that character.
+3. Convert recent messages into thread memories and load durable character
+   memory.
+4. Combine memory, persona profile, and neural graph into a
+   `NeuralStateSnapshot`.
+5. Convert that state into a `RuntimeIntentDecision`.
+6. Execute the selected runtime path.
+7. Attach a compact `NeuralRecord` to the assistant message.
+8. Optionally consolidate durable memory and persist grouped work artifacts.
 
 The important design choice is ordering. State derivation happens before model
-generation, and memory writeback happens after generation. That separation
-keeps the architecture inspectable.
+generation, path selection happens before execution, and memory writeback
+happens after generation. That separation keeps the architecture inspectable.
 
-## Route model
+## Neural routes and runtime paths
 
-Liberth Neural uses a small route vocabulary instead of a monolithic response
-mode. The goal is not to simulate intelligence. The goal is to force the
-runtime to explain what kind of answer it thinks it is producing.
+Liberth Neural now uses two vocabularies that serve different purposes. The
+goal is to separate what the neural layer is "leaning toward" from how the
+runtime actually executes the turn.
 
-The current route set is:
+The neural route set is:
 
 - `respond`
 - `tool`
@@ -268,15 +305,27 @@ The current route set is:
 - `learn`
 - `reflect`
 
-The dominant route becomes part of the public neural record. The runtime also
-keeps route alternatives, supporting neurons, modulators, workspace contents,
-and memory directives inside the same trace structure.
+The dominant neural route becomes part of the public neural record. The
+runtime also keeps route alternatives, supporting neurons, modulators,
+workspace contents, and memory directives inside the same trace structure.
+
+The runtime path set is:
+
+- `direct_runtime`
+- `planned_runtime`
+- `grouped_work`
+
+The intent router bridges the two layers. A turn might have a neural route of
+`learn`, for example, while still being executed through `planned_runtime`.
+Likewise, a turn can keep a neural route of `respond` but be upgraded into
+`grouped_work` if the request implies multi-stage planning, delivery, and QA.
 
 ## Memory model
 
-The memory model is deliberately conservative. The repository only stores local
-thread context and local durable memories. It does not implement retrieval
-augmentation over external databases or semantic vector search.
+The memory model is deliberately conservative. The repository stores local
+thread context, local durable memories, and grouped-work artifacts. It does
+not implement retrieval augmentation over external databases or semantic
+vector search.
 
 There are two memory scopes:
 
@@ -286,6 +335,11 @@ There are two memory scopes:
 On each turn, the runtime may derive a durable memory candidate. If the
 candidate is strong enough and not duplicated, it is appended to the character
 store and trimmed to the latest local window.
+
+Grouped work uses a parallel artifact history. Instead of folding every
+planning or QA step into global memory, the runtime stores those steps inside a
+`WorkRunRecord` so you can inspect the work trail without polluting the
+character memory lane.
 
 ## Provider abstraction
 
@@ -331,7 +385,16 @@ liberth-neural-standalone/
 The highest-value files for architecture reading are:
 
 - [`server/index.ts`](./server/index.ts) for the API boundary and runtime loop
+- [`server/persona-governance.ts`](./server/persona-governance.ts) for
+  blueprint repair and governance
+- [`server/neural-memory.ts`](./server/neural-memory.ts) for memory shaping and
+  neural record construction
 - [`server/neural-engine.ts`](./server/neural-engine.ts) for state derivation
+- [`server/intent-router.ts`](./server/intent-router.ts) for path selection
+- [`server/unified-runtime.ts`](./server/unified-runtime.ts) for execution-path
+  dispatch
+- [`server/work-orchestrator.ts`](./server/work-orchestrator.ts) for grouped
+  work planning, delivery, QA, and repair
 - [`server/roles.ts`](./server/roles.ts) for blueprint compilation
 - [`server/llm.ts`](./server/llm.ts) for provider adaptation
 - [`server/store.ts`](./server/store.ts) for local persistence
@@ -355,7 +418,7 @@ The main routes are:
 | `POST` | `/api/characters` | Create a character |
 | `PUT` | `/api/characters` | Update a character |
 | `GET` | `/api/conversations?characterId=...` | Load latest conversation |
-| `POST` | `/api/chat` | Execute one dialogue turn |
+| `POST` | `/api/chat` | Execute one unified runtime turn |
 | `GET` | `/api/deployments?characterId=...` | List outbound route records |
 | `POST` | `/api/deployments` | Create or update an outbound route |
 | `POST` | `/api/deployments/:deploymentId/send-test` | Send a test delivery |
@@ -379,8 +442,8 @@ the project.
 
 The storage model is intentionally simple because the research focus is
 inspectability, not infrastructure abstraction. Characters, conversations,
-global memories, provider settings, and related records are stored locally and
-updated through the server layer.
+global memories, provider settings, grouped work runs, and draft market
+listings are stored locally and updated through the server layer.
 
 This choice has two effects:
 
@@ -450,7 +513,9 @@ You should use this repository if you want to study or extend:
 
 - role-to-runtime compilation
 - inspectable dialogue routing
+- execution-path routing across direct, planned, and grouped work
 - compact memory writeback rules
+- local grouped work orchestration with visible QA artifacts
 - provider-agnostic character chat runtimes
 - local-first research prototypes for agent architecture
 
@@ -469,6 +534,8 @@ completeness. That means several limits are explicit rather than hidden.
 
 - The blueprint compiler is local and heuristic.
 - Memory writeback is simple and window-bounded.
+- Grouped work orchestration is local and single-node only.
+- Draft publication is metadata-only and not a marketplace backend.
 - The runtime uses local file-backed storage.
 - The API is shaped for the bundled workspace.
 - The project is still early-stage and exploratory.
@@ -484,6 +551,7 @@ In practical terms, that means the project aims to move toward:
 - a reusable runtime boundary that can live outside the main Liberth product
 - inspectable role compilation instead of hidden prompt assembly
 - portable neural records that other interfaces can replay or audit
+- portable grouped-work records that other shells can inspect or publish
 - local-first experimentation for memory policy, route policy, and provider
   policy
 - community forks that can swap storage, providers, or UI shells without
@@ -500,7 +568,9 @@ This repository is released under [AGPL-3.0-or-later](./LICENSE).
 ## Next steps
 
 If you want to work on this repository as an architecture artifact, start with
-[`server/neural-engine.ts`](./server/neural-engine.ts) and
+[`server/neural-engine.ts`](./server/neural-engine.ts),
+[`server/intent-router.ts`](./server/intent-router.ts), and
 [`src/types.ts`](./src/types.ts). If you want to push it toward a reusable
 open-source runtime, the next obvious steps are test coverage, release
-packaging, and separation of the core runtime from the browser workspace.
+packaging, stronger work-run replay tooling, and separation of the core
+runtime from the browser workspace.

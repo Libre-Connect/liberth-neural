@@ -77,6 +77,52 @@ function pickNonEmpty(primary?: string, fallback = "") {
   return String(primary || "").trim() || fallback;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryFetchError(error: unknown) {
+  const message = String((error as any)?.message || "").toLowerCase();
+  const causeMessage = String((error as any)?.cause?.message || "").toLowerCase();
+  const detail = `${message} ${causeMessage}`.trim();
+  if (!detail) return false;
+  return (
+    detail.includes("fetch failed")
+    || detail.includes("networkerror")
+    || detail.includes("timeout")
+    || detail.includes("timed out")
+    || detail.includes("socket")
+    || detail.includes("econnreset")
+    || detail.includes("enotfound")
+    || detail.includes("eai_again")
+  );
+}
+
+function describeLlmError(error: unknown) {
+  const message = String((error as any)?.message || error || "llm_request_failed").trim();
+  const causeMessage = String((error as any)?.cause?.message || "").trim();
+  if (causeMessage && !message.includes(causeMessage)) {
+    return `${message}: ${causeMessage}`;
+  }
+  return message || "llm_request_failed";
+}
+
+async function fetchWithRetry(url: string, init: RequestInit, attempts = 2) {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fetch(url, init);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !shouldRetryFetchError(error)) {
+        throw error;
+      }
+      await sleep(250 * attempt);
+    }
+  }
+  throw lastError || new Error("fetch failed");
+}
+
 function providerApiStyle(mode: ProviderMode): ProviderApiStyle {
   return getProviderCatalogItem(mode).apiStyle;
 }
@@ -110,7 +156,11 @@ function resolveApiKeyForMode(mode: ProviderMode, explicit?: string) {
 
   switch (mode) {
     case "glm-main":
-      return "";
+      return (
+        resolveEnv("GLM_API_KEY")
+        || resolveEnv("ZHIPUAI_API_KEY")
+        || resolveEnv("BIGMODEL_API_KEY")
+      );
     case "openrouter":
       return resolveEnv("OPENROUTER_API_KEY");
     case "deepseek":
@@ -304,7 +354,7 @@ async function openAiCompatibleChat(
     headers["X-Title"] = "Liberth Neural";
   }
 
-  const response = await fetch(`${runtime.baseUrl}/chat/completions`, {
+  const response = await fetchWithRetry(`${runtime.baseUrl}/chat/completions`, {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -349,7 +399,7 @@ async function anthropicChat(
       content: message.content,
     }));
 
-  const response = await fetch(`${runtime.baseUrl}/messages`, {
+  const response = await fetchWithRetry(`${runtime.baseUrl}/messages`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -405,7 +455,7 @@ async function googleGeminiChat(
       parts: [{ text: message.content }],
     }));
 
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `${runtime.baseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(runtime.apiKey)}`,
     {
       method: "POST",
@@ -454,7 +504,7 @@ async function mainProjectGlmChat(
     throw new Error("GLM API key is not configured");
   }
 
-  const response = await fetch(`${ZHIPUAI_BASE_URL}/chat/completions`, {
+  const response = await fetchWithRetry(`${ZHIPUAI_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${runtime.apiKey}`,
@@ -567,7 +617,7 @@ async function openAiCompatibleChatWithTools(
     headers["X-Title"] = "Liberth Neural";
   }
 
-  const response = await fetch(
+  const response = await fetchWithRetry(
     isGlmMain ? `${ZHIPUAI_BASE_URL}/chat/completions` : `${runtime.baseUrl}/chat/completions`,
     {
     method: "POST",
@@ -671,7 +721,7 @@ async function anthropicChatWithTools(
   }
 
   const mapped = mapAnthropicConversation(messages);
-  const response = await fetch(`${runtime.baseUrl}/messages`, {
+  const response = await fetchWithRetry(`${runtime.baseUrl}/messages`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -792,7 +842,7 @@ async function googleGeminiChatWithTools(
   }
 
   const mapped = mapGeminiConversation(messages);
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `${runtime.baseUrl}/models/${encodeURIComponent(runtime.model)}:generateContent?key=${encodeURIComponent(runtime.apiKey)}`,
     {
       method: "POST",
@@ -904,7 +954,7 @@ export async function completeTextWithToolsDetailed(params: {
     return {
       value: params.fallback(),
       trace: resolveTraceWithUsage(params.config, "fallback", {
-        reason: String(error?.message || error || "native_tool_request_failed"),
+        reason: describeLlmError(error),
         nativeTools: true,
       }),
       toolCall: null,
@@ -940,11 +990,7 @@ export async function completeJsonDetailed<T>(
   } catch (error: any) {
     return {
       value: fallback(),
-      trace: resolveTrace(
-        config,
-        "fallback",
-        String(error?.message || error || "llm_request_failed"),
-      ),
+      trace: resolveTrace(config, "fallback", describeLlmError(error)),
     };
   }
 }
@@ -979,11 +1025,7 @@ export async function completeTextDetailed(
   } catch (error: any) {
     return {
       value: fallback(),
-      trace: resolveTrace(
-        config,
-        "fallback",
-        String(error?.message || error || "llm_request_failed"),
-      ),
+      trace: resolveTrace(config, "fallback", describeLlmError(error)),
     };
   }
 }

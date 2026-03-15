@@ -340,19 +340,21 @@ function fallbackReplyText(input: {
   const prefersChinese = language.includes("zh") || language.includes("chinese");
   if (prefersChinese) {
     return [
-      "我会继续沿用当前 bundle 和角色设定来回答。",
+      "实时模型这次没有返回结果，下面是本地降级回复，不是实际模型输出。",
       `你刚才的问题是：“${input.userMessage}”。`,
       input.historyCount > 0
         ? `我已经保留这段会话里的最近 ${input.historyCount} 轮上下文。`
         : "这是当前会话的第一轮输入。",
+      "请重试一次，或者检查 Runtime 里的模型配置和网络状态。",
     ].join("\n");
   }
   return [
-    "I will continue through the current bundle and role definition.",
+    "The live model did not return a response for this turn, so this is a local fallback instead of an actual model reply.",
     `Your latest message was: "${input.userMessage}".`,
     input.historyCount > 0
       ? `I am carrying the latest ${input.historyCount} turns of context into this reply.`
       : "This is the first message in the current conversation.",
+    "Retry the turn, or check the runtime model settings and network path.",
   ].join("\n");
 }
 

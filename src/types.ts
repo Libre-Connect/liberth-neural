@@ -368,6 +368,81 @@ export type NeuralRecord = {
   provider: GenerationTrace;
 };
 
+export type RuntimeExecutionPath =
+  | "direct_runtime"
+  | "planned_runtime"
+  | "grouped_work";
+
+export type RuntimeIntentDecision = {
+  path: RuntimeExecutionPath;
+  reason: string;
+  confidence: number;
+  publicationCandidate: boolean;
+  workIntent?: WorkIntent | null;
+};
+
+export type WorkIntent = {
+  title: string;
+  summary: string;
+  objective: string;
+  taskType: "analysis" | "spec" | "delivery";
+  stageHints: string[];
+  publicationCandidate: boolean;
+};
+
+export type WorkArtifactKind =
+  | "brief"
+  | "plan"
+  | "delivery"
+  | "qa"
+  | "repair"
+  | "publication";
+
+export type WorkArtifactRecord = {
+  id: string;
+  kind: WorkArtifactKind;
+  title: string;
+  content: string;
+  createdAt: number;
+  updatedAt: number;
+  status: "created" | "accepted" | "rejected";
+  notes?: string[];
+};
+
+export type WorkRunRecord = {
+  id: string;
+  characterId: string;
+  conversationId: string;
+  title: string;
+  summary: string;
+  objective: string;
+  taskType: WorkIntent["taskType"];
+  sourceRoute: NeuralRoute;
+  executionPath: RuntimeExecutionPath;
+  status: "queued" | "running" | "completed" | "failed";
+  publicationCandidate: boolean;
+  createdAt: number;
+  updatedAt: number;
+  userMessage: string;
+  stageNotes: string[];
+  artifacts: WorkArtifactRecord[];
+  qaStatus: "pending" | "passed" | "failed";
+  marketListingId?: string;
+};
+
+export type MarketListingRecord = {
+  id: string;
+  characterId: string;
+  workRunId: string;
+  title: string;
+  summary: string;
+  artifactKind: WorkArtifactKind;
+  status: "draft" | "published";
+  createdAt: number;
+  updatedAt: number;
+  tags: string[];
+};
+
 export type RoleBlueprint = {
   summary: string;
   greeting: string;
@@ -529,6 +604,8 @@ export type StoreShape = {
   installedSkills: InstalledSkillRecord[];
   automations: AutomationRecord[];
   automationRuns: AutomationRunRecord[];
+  workRuns: WorkRunRecord[];
+  marketListings: MarketListingRecord[];
   settings: {
     provider: ProviderSettings;
   };
