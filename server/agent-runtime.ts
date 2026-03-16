@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import type {
   AutomationRecord,
+  ChatAttachment,
   CharacterRecord,
   SearchResultRecord,
 } from "../src/types";
@@ -11,6 +12,7 @@ import type {
   LlmToolDefinition,
 } from "./llm";
 import {
+  buildUserMessageContent,
   completeTextWithToolsDetailed,
   supportsNativeToolCalling,
 } from "./llm";
@@ -61,6 +63,7 @@ type RoleAgentTurnInput = {
   systemPrompt: string;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userMessage: string;
+  userAttachments?: ChatAttachment[];
   config?: LlmRuntimeConfig;
   allowMutatingTools?: boolean;
 };
@@ -200,6 +203,17 @@ function buildToolSpecs(allowMutatingTools: boolean): ToolSpec[] {
 
 function buildLegacyToolPrompt(allowMutatingTools: boolean) {
   const tools = buildToolSpecs(allowMutatingTools);
+  const automationFlowRules = allowMutatingTools
+    ? [
+        "- If the user asks for recurring updates, monitoring, scheduling, alerts, or automation, do not stop at a static explanation.",
+        "- For recurring capability requests, prefer this sequence when appropriate: list_attached_skills -> search_skills -> install_skill -> read_skill -> create_automation.",
+        "- search_skills can discover installable external skills even when they are not already attached to the workspace.",
+        "- If the user asks for live prices, market data, news, or other refreshed information, prefer tool-backed retrieval over a generic limitation message.",
+        "- If the user asks you to set up recurring execution, finish by actually calling create_automation instead of only describing how it could work.",
+      ]
+    : [
+        "- If the user asks for live prices, market data, news, or other refreshed information, prefer tool-backed retrieval over a generic limitation message.",
+      ];
   return [
     "## BUILTIN_TOOLS.md",
     "You are running inside an OpenClaw-like tool runtime with typed built-in tools.",
@@ -212,6 +226,7 @@ function buildLegacyToolPrompt(allowMutatingTools: boolean) {
     "- Do not repeat the same tool call with identical arguments unless the user explicitly asks.",
     "- Prefer no more than 3 tool calls before giving the final answer.",
     "- If no tool is needed, answer normally.",
+    ...automationFlowRules,
     "Available tools:",
     ...tools.map(
       (tool) => `- ${tool.name}: ${tool.description} Args: ${tool.args}`,
@@ -221,6 +236,17 @@ function buildLegacyToolPrompt(allowMutatingTools: boolean) {
 
 function buildNativeToolPrompt(allowMutatingTools: boolean) {
   const tools = buildToolSpecs(allowMutatingTools);
+  const automationFlowRules = allowMutatingTools
+    ? [
+        "If the user asks for recurring updates, monitoring, scheduling, alerts, or automation, prefer an actual tool flow over a hypothetical explanation.",
+        "For recurring capability requests, use this sequence when it fits: list_attached_skills, search_skills, install_skill, read_skill, then create_automation.",
+        "search_skills can discover installable external skills even when they are not already attached to the workspace.",
+        "If the user asks for live prices, market data, news, or refreshed information, prefer tool-backed retrieval over a generic limitation message.",
+        "If the user asks you to set up recurring execution, finish by calling create_automation with a concrete name, prompt, and intervalMinutes.",
+      ]
+    : [
+        "If the user asks for live prices, market data, news, or refreshed information, prefer tool-backed retrieval over a generic limitation message.",
+      ];
   return [
     "## BUILTIN_TOOLS.md",
     "You are running inside an OpenClaw-like tool runtime with typed built-in tools.",
@@ -229,6 +255,7 @@ function buildNativeToolPrompt(allowMutatingTools: boolean) {
     "Do not claim tool execution without a real tool result.",
     "If no tool is needed, answer normally.",
     "Prefer no more than 3 tool calls before the final answer.",
+    ...automationFlowRules,
     "Available tools:",
     ...tools.map(
       (tool) => `- ${tool.name}: ${tool.description} Args: ${tool.args}`,
@@ -560,6 +587,7 @@ async function runLegacyToolLoop(
       systemPrompt: `${input.systemPrompt}\n\n${toolPrompt}`,
       history: scratchHistory,
       userMessage: input.userMessage,
+      userAttachments: input.userAttachments,
       config: input.config,
     });
     lastGeneration = result.generation;
@@ -637,6 +665,7 @@ async function runLegacyToolLoop(
       ].join("\n\n"),
       history: scratchHistory,
       userMessage: input.userMessage,
+      userAttachments: input.userAttachments,
       config: input.config,
     });
 
@@ -698,7 +727,7 @@ async function runNativeToolLoop(
     })),
     {
       role: "user",
-      content: input.userMessage,
+      content: buildUserMessageContent(input.userMessage, input.userAttachments),
     },
   ];
   const toolEvents: ToolEvent[] = [];
@@ -811,6 +840,7 @@ async function runNativeToolLoop(
       ].join("\n\n"),
       history: scratchHistory,
       userMessage: input.userMessage,
+      userAttachments: input.userAttachments,
       config: input.config,
     });
 

@@ -24,12 +24,21 @@ function compactWhitespace(value: string) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function summarizeMessageForHistory(message: Pick<ChatMessage, "content" | "attachments">) {
+  const parts = [compactWhitespace(message.content)];
+  const imageCount = Array.isArray(message.attachments) ? message.attachments.length : 0;
+  if (imageCount > 0) {
+    parts.push(`[Attached ${imageCount} image${imageCount > 1 ? "s" : ""}]`);
+  }
+  return parts.filter(Boolean).join(" ");
+}
+
 function formatTranscript(messages: ChatMessage[]) {
   return truncateText(
     messages
       .map((message, index) => {
         const prefix = message.role === "user" ? "USER" : "ASSISTANT";
-        return `${index + 1}. ${prefix}: ${compactWhitespace(message.content)}`;
+        return `${index + 1}. ${prefix}: ${summarizeMessageForHistory(message)}`;
       })
       .join("\n"),
     TRANSCRIPT_CHAR_LIMIT,
@@ -39,7 +48,7 @@ function formatTranscript(messages: ChatMessage[]) {
 function fallbackSummary(messages: ChatMessage[], instructions?: string) {
   const recent = messages
     .slice(-6)
-    .map((message) => `${message.role}: ${compactWhitespace(message.content)}`)
+    .map((message) => `${message.role}: ${summarizeMessageForHistory(message)}`)
     .filter(Boolean);
 
   const lines = [
@@ -188,10 +197,9 @@ export function buildConversationHistory(
   history.push(
     ...tail.map((message) => ({
       role: message.role,
-      content: message.content,
+      content: summarizeMessageForHistory(message),
     })),
   );
 
   return history;
 }
-

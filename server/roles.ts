@@ -1,4 +1,5 @@
 import type {
+  ChatAttachment,
   GenerationTrace,
   NeuralMemoryRecord,
   NeuralStateSnapshot,
@@ -12,6 +13,7 @@ import {
   deriveNeuralStateSnapshot,
 } from "./neural-engine";
 import {
+  buildUserMessageContent,
   completeJsonDetailed,
   completeTextDetailed,
   type LlmRuntimeConfig,
@@ -69,12 +71,17 @@ function titleCaseWords(value: string) {
     .join(" ");
 }
 
+function containsChinese(value: string) {
+  return /[\u4e00-\u9fff]/.test(String(value || ""));
+}
+
 function fallbackDefinitionFromBrief(input: {
   brief: string;
   language: string;
 }): RoleDefinitionInput {
   const brief = String(input.brief || "").trim();
-  const language = String(input.language || "English").trim() || "English";
+  const requestedLanguage = String(input.language || "").trim();
+  const language = requestedLanguage || (containsChinese(brief) ? "Chinese" : "English");
   const compact = brief.replace(/\s+/g, " ").trim();
   const words = compact
     .replace(/[^a-zA-Z0-9\s-]/g, " ")
@@ -82,20 +89,144 @@ function fallbackDefinitionFromBrief(input: {
     .filter(Boolean)
     .slice(0, 4);
   const name = titleCaseWords(words.join(" ")) || "Neural Character";
-  const oneLiner = compact || "A focused neural character built from a concise brief.";
+  const oneLiner = compact || "A distinct neural character built from a role brief.";
+  const subject = compact || name;
+  const lowerLanguage = language.toLowerCase();
+  const useEnglish = lowerLanguage.includes("english") || lowerLanguage === "en";
+
+  if (useEnglish) {
+    return {
+      name,
+      oneLiner,
+      domain: `recognizable perspective and decision-making style shaped by "${subject}"`,
+      audience: `people who want ${name}'s lens, priorities, and speaking cadence instead of a generic assistant reply`,
+      tone: `distinctive, opinionated, concrete, and stable in the voice implied by "${subject}"`,
+      personality: `${name} should sound unmistakably like the role described in "${subject}". Preserve the worldview, verbal habits, priorities, and emotional temperature implied by the brief. Avoid neutral assistant phrasing.`,
+      goals: `Answer usefully through ${name}'s own lens, keep the voice stable across turns, and make every reply feel authored by this character rather than by a default AI assistant.`,
+      boundaries: `Do not collapse into generic assistant language. Stay inside the role, be honest about uncertainty, avoid inventing hidden capabilities, and ask for one clarifying detail if the brief is too thin to preserve a distinctive voice.`,
+      knowledge: `Anchor future dialogue in these brief signals: ${subject}. Reuse its vocabulary, worldview, priorities, analogies, and likely examples when answering.`,
+      greeting: `Hi, I'm ${name}. I'll answer with the voice, priorities, and decision style implied by "${subject}".`,
+      language,
+    };
+  }
 
   return {
     name,
     oneLiner,
-    domain: "advisory dialogue",
-    audience: "general users",
-    tone: "clear, grounded, and direct",
-    personality: `A role-consistent character shaped by this concept: ${oneLiner}`,
-    goals: "Stay useful, coherent, and aligned with the character brief.",
-    boundaries: "Do not break character continuity, invent hidden capabilities, or cross explicit safety boundaries.",
-    knowledge: oneLiner,
-    greeting: `Hi, I'm ${name}. I'll respond through this neural character lens.`,
+    domain: `围绕“${subject}”形成的鲜明视角、判断方式与说话习惯`,
+    audience: `想得到 ${name} 这类角色视角、优先级和表达方式的用户，而不是默认 AI 回复`,
+    tone: `带有“${subject}”暗示的明确立场、具体判断和稳定语气`,
+    personality: `${name} 必须明显像“${subject}”这个角色在说话。保持这段 brief 暗示的世界观、措辞习惯、关注重点和情绪温度，不要滑回中性助手口吻。`,
+    goals: `用 ${name} 自己的视角给出有用答案，在多轮对话里维持稳定人格，让回复听起来像这个角色本人而不是通用 AI。`,
+    boundaries: `不要退化成默认助手语气。保持角色连续性，如实表达不确定性，不要虚构隐藏能力；如果 brief 太薄，就在不出戏的前提下追问一个关键澄清点。`,
+    knowledge: `后续对话要锚定这段 brief 的信号：${subject}。复用其中的词汇、价值排序、判断框架、比喻方式和典型例子。`,
+    greeting: `你好，我是 ${name}。接下来我会按“${subject}”暗示的人格、优先级和判断方式来回答。`,
     language,
+  };
+}
+
+function isWeakPlaceholderField(
+  field: keyof RoleDefinitionInput,
+  value: string,
+  context: { oneLiner: string; name: string },
+) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  const lower = normalized.toLowerCase();
+  const oneLiner = String(context.oneLiner || "").trim().toLowerCase();
+  const name = String(context.name || "").trim().toLowerCase();
+
+  switch (field) {
+    case "domain":
+      return lower === "advisory dialogue" || lower === "general conversation";
+    case "audience":
+      return lower === "general users" || lower === "everyone";
+    case "tone":
+      return lower === "clear, grounded, and direct" || lower === "helpful, clear, and direct";
+    case "personality":
+      return /role-consistent character|shaped by this concept|neutral assistant|default ai assistant/.test(lower);
+    case "goals":
+      return /stay useful, coherent, and aligned with the character brief/.test(lower);
+    case "boundaries":
+      return /do not break character continuity/.test(lower);
+    case "knowledge":
+      return lower === oneLiner || lower === name || lower === "open-ended";
+    case "greeting":
+      return /neural character lens|当前神经元人格/.test(lower);
+    default:
+      return false;
+  }
+}
+
+function weakPlaceholderScore(definition: RoleDefinitionInput) {
+  const context = {
+    oneLiner: definition.oneLiner,
+    name: definition.name,
+  };
+  return ([
+    "domain",
+    "audience",
+    "tone",
+    "personality",
+    "goals",
+    "boundaries",
+    "knowledge",
+    "greeting",
+  ] as Array<keyof RoleDefinitionInput>).reduce((score, field) => {
+    return score + (isWeakPlaceholderField(field, definition[field], context) ? 1 : 0);
+  }, 0);
+}
+
+function normalizeRoleDefinitionInput(definition: RoleDefinitionInput): RoleDefinitionInput {
+  return {
+    name: String(definition.name || "").trim(),
+    oneLiner: String(definition.oneLiner || "").trim(),
+    domain: String(definition.domain || "").trim(),
+    audience: String(definition.audience || "").trim(),
+    tone: String(definition.tone || "").trim(),
+    personality: String(definition.personality || "").trim(),
+    goals: String(definition.goals || "").trim(),
+    boundaries: String(definition.boundaries || "").trim(),
+    knowledge: String(definition.knowledge || "").trim(),
+    greeting: String(definition.greeting || "").trim(),
+    language: String(definition.language || "English").trim() || "English",
+  };
+}
+
+export function stabilizeRoleDefinition(definition: RoleDefinitionInput): RoleDefinitionInput {
+  const normalized = normalizeRoleDefinitionInput(definition);
+  const seedBrief =
+    normalized.oneLiner || normalized.name || normalized.knowledge || normalized.personality;
+  const fallback = fallbackDefinitionFromBrief({
+    brief: seedBrief,
+    language: normalized.language,
+  });
+  const shouldRepairWeakFields = weakPlaceholderScore(normalized) >= 2;
+  const context = {
+    oneLiner: normalized.oneLiner || fallback.oneLiner,
+    name: normalized.name || fallback.name,
+  };
+
+  const resolveField = (field: keyof RoleDefinitionInput) => {
+    const current = normalized[field];
+    if (!current) return fallback[field];
+    if (shouldRepairWeakFields && isWeakPlaceholderField(field, current, context)) {
+      return fallback[field];
+    }
+    return current;
+  };
+
+  return {
+    name: resolveField("name"),
+    oneLiner: resolveField("oneLiner"),
+    domain: resolveField("domain"),
+    audience: resolveField("audience"),
+    tone: resolveField("tone"),
+    personality: resolveField("personality"),
+    goals: resolveField("goals"),
+    boundaries: resolveField("boundaries"),
+    knowledge: resolveField("knowledge"),
+    greeting: resolveField("greeting"),
+    language: resolveField("language"),
   };
 }
 
@@ -275,6 +406,10 @@ export async function composeCharacterFromBrief(input: {
           "Expand a one-line character concept into JSON only.",
           "Return exactly these fields: name, oneLiner, domain, audience, tone, personality, goals, boundaries, knowledge, greeting, language.",
           "Keep every field concise, specific, and internally consistent.",
+          "Make the persona unmistakable. The result must not read like a generic helpful AI assistant.",
+          "Do not use filler defaults such as advisory dialogue, general users, clear and direct, or stay useful and coherent.",
+          "If the brief implies a public figure, archetype, or profession, preserve the recognizable worldview, priorities, and cadence in a legally safe descriptive way.",
+          "The boundaries field must protect continuity without flattening the role back into neutral assistant language.",
           "The language field must be a plain human-readable label such as English or Chinese.",
           "Do not include markdown fences or explanations.",
         ].join("\n"),
@@ -292,7 +427,9 @@ export async function composeCharacterFromBrief(input: {
     input.config,
   );
 
-  const definition = normalizeExpandedDefinition(expansion.value, fallback);
+  const definition = stabilizeRoleDefinition(
+    normalizeExpandedDefinition(expansion.value, fallback),
+  );
   const blueprint = await generateBlueprint(definition, input.config);
 
   return {
@@ -307,6 +444,7 @@ export async function generateRoleReplyDetailed(input: {
   definition?: RoleDefinitionInput;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userMessage: string;
+  userAttachments?: ChatAttachment[];
   config?: LlmRuntimeConfig;
 }) {
   const fallback = () => {
@@ -338,7 +476,10 @@ export async function generateRoleReplyDetailed(input: {
     [
       { role: "system", content: input.systemPrompt },
       ...input.history,
-      { role: "user", content: input.userMessage },
+      {
+        role: "user",
+        content: buildUserMessageContent(input.userMessage, input.userAttachments),
+      },
     ],
     fallback,
     input.config,
@@ -355,6 +496,7 @@ export async function generateRoleReply(input: {
   definition?: RoleDefinitionInput;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userMessage: string;
+  userAttachments?: ChatAttachment[];
   config?: LlmRuntimeConfig;
 }) {
   const result = await generateRoleReplyDetailed(input);

@@ -1,8 +1,9 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   type AutomationRecord,
   type AutomationRunRecord,
   type CharacterRecord,
+  type ChatAttachment,
   type ChatMessage,
   type ConversationRecord,
   type DeploymentChannel,
@@ -71,6 +72,9 @@ const timeFormatter = new Intl.DateTimeFormat("en-US", {
   minute: "2-digit",
 });
 
+const CLIENT_CHAT_IMAGE_MAX_COUNT = 4;
+const CLIENT_CHAT_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -86,6 +90,28 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
     );
   }
   return response.json() as Promise<T>;
+}
+
+function createClientAttachmentId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `img_${crypto.randomUUID()}`;
+  }
+  return `img_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Failed to read image file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function attachmentSummary(attachments?: ChatAttachment[]) {
+  const count = Array.isArray(attachments) ? attachments.length : 0;
+  if (!count) return "";
+  return count === 1 ? "Image message" : `${count} images`;
 }
 
 function starterConversation(character?: CharacterRecord | null): ChatMessage[] {
@@ -282,7 +308,7 @@ function conversationSnippet(conversation: ConversationRecord) {
   const latestUser = [...conversation.messages]
     .reverse()
     .find((message) => message.role === "user");
-  return latestUser?.content || conversation.messages[0]?.content || "New chat";
+  return latestUser?.content || attachmentSummary(latestUser?.attachments) || conversation.messages[0]?.content || "New chat";
 }
 
 function sortConversations(conversations: ConversationRecord[]) {
@@ -312,6 +338,7 @@ export default function App() {
   const [blueprintPreview, setBlueprintPreview] = useState<RoleBlueprint | null>(null);
   const [showAdvancedBuilder, setShowAdvancedBuilder] = useState(false);
   const [chatText, setChatText] = useState("");
+  const [chatAttachments, setChatAttachments] = useState<ChatAttachment[]>([]);
   const [studioBusy, setStudioBusy] = useState(false);
   const [studioError, setStudioError] = useState("");
   const [studioSaved, setStudioSaved] = useState("");
@@ -350,6 +377,7 @@ export default function App() {
   const [automationBusy, setAutomationBusy] = useState("");
   const [automationError, setAutomationError] = useState("");
   const messageStageRef = useRef<HTMLDivElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   const selectedCharacter = useMemo(
     () => characters.find((item) => item.id === selectedCharacterId) || null,
@@ -594,7 +622,7 @@ export default function App() {
   async function handleComposeCharacter(event: FormEvent) {
     event.preventDefault();
     if (!characterBrief.trim()) {
-      setStudioError("Give the character a one-line concept first.");
+      setStudioError("Describe the role in one sentence, with voice or behavior, not just a name.");
       return;
     }
 
@@ -703,14 +731,72 @@ export default function App() {
     }
   }
 
+  async function handleChatImageSelection(event: ChangeEvent<HTMLInputElement>) {
+    const fileList = Array.from(event.target.files || []);
+    if (!fileList.length) return;
+
+    const remainingSlots = Math.max(0, CLIENT_CHAT_IMAGE_MAX_COUNT - chatAttachments.length);
+    if (!remainingSlots) {
+      setChatError(`You can attach up to ${CLIENT_CHAT_IMAGE_MAX_COUNT} images per message.`);
+      event.target.value = "";
+      return;
+    }
+
+    const selectedFiles = fileList.slice(0, remainingSlots);
+    const invalidFile = selectedFiles.find(
+      (file) => !String(file.type || "").toLowerCase().startsWith("image/"),
+    );
+    if (invalidFile) {
+      setChatError(`${invalidFile.name} is not an image file.`);
+      event.target.value = "";
+      return;
+    }
+
+    const oversizedFile = selectedFiles.find((file) => file.size > CLIENT_CHAT_IMAGE_MAX_BYTES);
+    if (oversizedFile) {
+      setChatError(`${oversizedFile.name} exceeds the 4MB image limit.`);
+      event.target.value = "";
+      return;
+    }
+
+    setChatError("");
+    try {
+      const nextAttachments = await Promise.all(
+        selectedFiles.map(async (file) => ({
+          id: createClientAttachmentId(),
+          kind: "image" as const,
+          mimeType: file.type,
+          dataUrl: await readFileAsDataUrl(file),
+          name: file.name,
+          sizeBytes: file.size,
+        })),
+      );
+      setChatAttachments((current) => [...current, ...nextAttachments]);
+    } catch (error: any) {
+      setChatError(String(error?.message || error));
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  function handleRemoveChatAttachment(attachmentId: string) {
+    setChatAttachments((current) => current.filter((item) => item.id !== attachmentId));
+  }
+
+  function handleOpenChatImagePicker() {
+    imageInputRef.current?.click();
+  }
+
   async function handleSendMessage(event: FormEvent) {
     event.preventDefault();
-    if (!selectedCharacter || !chatText.trim()) return;
+    if (!selectedCharacter || (!chatText.trim() && !chatAttachments.length)) return;
 
     setChatBusy(true);
     setChatError("");
     const userContent = chatText.trim();
+    const userAttachments = chatAttachments.slice();
     setChatText("");
+    setChatAttachments([]);
 
     try {
       const payload = await requestJson<ChatPayload>("/api/chat", {
@@ -719,6 +805,7 @@ export default function App() {
           characterId: selectedCharacter.id,
           conversationId: selectedConversationId || undefined,
           message: userContent,
+          attachments: userAttachments,
         }),
       });
       patchCharacter(payload.character);
@@ -729,6 +816,8 @@ export default function App() {
         setBlueprintPreview(payload.character.blueprint);
       }
     } catch (error: any) {
+      setChatText(userContent);
+      setChatAttachments(userAttachments);
       setChatError(String(error?.message || error));
     } finally {
       setChatBusy(false);
@@ -1268,7 +1357,7 @@ export default function App() {
           <div className="panel-header">
             <div>
               <p className="eyebrow">Character Builder</p>
-              <h2>One-line concept first</h2>
+              <h2>Role sentence first</h2>
             </div>
             <button className="ghost-button" type="button" onClick={prepareCreateCharacter}>
               New character
@@ -1281,7 +1370,7 @@ export default function App() {
               <textarea
                 value={characterBrief}
                 onChange={(event) => setCharacterBrief(event.target.value)}
-                placeholder="Example: A midnight strategy editor who answers like a calm newsroom chief."
+                placeholder="Example: Answer like a skeptical founder who cuts to first principles, dismisses vague claims, and sounds impatient with fluff."
               />
             </label>
 
@@ -1309,8 +1398,9 @@ export default function App() {
           </form>
 
           <p className="small-note">
-            Describe the role in one sentence. AI expands the full character definition first,
-            then builds the neural bundle from that result.
+            Give the builder one sentence with viewpoint, behavior, or cadence. Do not enter only a
+            name. AI expands that into a full persona definition first, then builds the neural
+            bundle from it.
           </p>
 
           {studioError ? <p className="error-banner">{studioError}</p> : null}
@@ -2006,9 +2096,21 @@ export default function App() {
                       <span className="message-role">{message.role}</span>
                       <span className="message-time">{formatTime(message.createdAt)}</span>
                     </div>
-                    <div className="message-copy">
-                      <p>{message.content}</p>
-                    </div>
+                    {message.content.trim() ? (
+                      <div className="message-copy">
+                        <p>{message.content}</p>
+                      </div>
+                    ) : null}
+                    {Array.isArray(message.attachments) && message.attachments.length ? (
+                      <div className="message-attachments">
+                        {message.attachments.map((attachment) => (
+                          <figure key={attachment.id} className="message-attachment">
+                            <img src={attachment.dataUrl} alt={attachment.name || "chat upload"} />
+                            {attachment.name ? <figcaption>{attachment.name}</figcaption> : null}
+                          </figure>
+                        ))}
+                      </div>
+                    ) : null}
                     {message.role === "assistant" && message.generation ? (
                       <>
                         <div className="message-trace">
@@ -2051,6 +2153,36 @@ export default function App() {
 
               <div className="chat-composer-shell">
                 <form className="composer chat-composer" onSubmit={handleSendMessage}>
+                  <input
+                    ref={imageInputRef}
+                    className="chat-image-input"
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    onChange={handleChatImageSelection}
+                    disabled={chatBusy}
+                  />
+                  {chatAttachments.length ? (
+                    <div className="chat-attachment-strip">
+                      {chatAttachments.map((attachment) => (
+                        <div key={attachment.id} className="chat-attachment-chip">
+                          <img src={attachment.dataUrl} alt={attachment.name || "pending upload"} />
+                          <div className="chat-attachment-chip-copy">
+                            <strong>{attachment.name || "Image"}</strong>
+                          </div>
+                          <button
+                            className="chat-attachment-remove"
+                            type="button"
+                            onClick={() => handleRemoveChatAttachment(attachment.id)}
+                            disabled={chatBusy}
+                            aria-label={`Remove ${attachment.name || "image"}`}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                   <textarea
                     value={chatText}
                     onChange={(event) => setChatText(event.target.value)}
@@ -2062,7 +2194,19 @@ export default function App() {
                     disabled={chatBusy}
                   />
                   <div className="actions">
-                    <button className="primary-button" type="submit" disabled={chatBusy}>
+                    <button
+                      className="ghost-button"
+                      type="button"
+                      onClick={handleOpenChatImagePicker}
+                      disabled={chatBusy || chatAttachments.length >= CLIENT_CHAT_IMAGE_MAX_COUNT}
+                    >
+                      Image
+                    </button>
+                    <button
+                      className="primary-button"
+                      type="submit"
+                      disabled={chatBusy || (!chatText.trim() && !chatAttachments.length)}
+                    >
                       {chatBusy ? "Sending..." : "Send"}
                     </button>
                   </div>

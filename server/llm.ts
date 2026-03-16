@@ -1,10 +1,24 @@
 import "./env";
-import type { ProviderMode } from "../src/types";
+import type { ChatAttachment, ProviderMode } from "../src/types";
 import { getProviderCatalogItem } from "../src/types";
+
+export type LlmImagePart = {
+  type: "image";
+  mimeType: string;
+  dataUrl: string;
+};
+
+export type LlmTextPart = {
+  type: "text";
+  text: string;
+};
+
+export type LlmContentPart = LlmTextPart | LlmImagePart;
+export type LlmMessageContent = string | LlmContentPart[];
 
 type ChatMessage = {
   role: "system" | "user" | "assistant";
-  content: string;
+  content: LlmMessageContent;
 };
 
 export type LlmToolDefinition = {
@@ -22,7 +36,7 @@ export type LlmToolCall = {
 export type LlmConversationMessage =
   | {
       role: "system" | "user";
-      content: string;
+      content: LlmMessageContent;
     }
   | {
       role: "assistant";
@@ -308,6 +322,127 @@ function normalizeOpenAiTextContent(content: unknown) {
     .join("\n");
 }
 
+function getBase64PayloadFromDataUrl(dataUrl: string) {
+  const match = String(dataUrl || "").match(/^data:([^;,]+);base64,(.+)$/i);
+  if (!match) {
+    throw new Error("Invalid image data URL");
+  }
+  return {
+    mimeType: String(match[1] || "").trim().toLowerCase(),
+    base64: String(match[2] || "").trim(),
+  };
+}
+
+function normalizeMessageTextContent(content: LlmMessageContent) {
+  if (typeof content === "string") {
+    return content;
+  }
+  return content
+    .filter((part): part is LlmTextPart => part.type === "text")
+    .map((part) => String(part.text || ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+function normalizeMessageContentParts(content: LlmMessageContent): LlmContentPart[] {
+  if (typeof content === "string") {
+    return content.trim() ? [{ type: "text", text: content }] : [];
+  }
+  return content.filter((part) => {
+    if (!part || typeof part !== "object") return false;
+    if (part.type === "text") {
+      return Boolean(String(part.text || "").trim());
+    }
+    if (part.type === "image") {
+      return Boolean(String(part.mimeType || "").trim() && String(part.dataUrl || "").trim());
+    }
+    return false;
+  });
+}
+
+function toAnthropicContent(content: LlmMessageContent) {
+  const parts = normalizeMessageContentParts(content);
+  if (!parts.length) {
+    return "";
+  }
+  return parts.map((part) => {
+    if (part.type === "text") {
+      return { type: "text", text: part.text };
+    }
+    const image = getBase64PayloadFromDataUrl(part.dataUrl);
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: part.mimeType || image.mimeType,
+        data: image.base64,
+      },
+    };
+  });
+}
+
+function toOpenAiMessageContent(content: LlmMessageContent) {
+  const parts = normalizeMessageContentParts(content);
+  if (!parts.some((part) => part.type === "image")) {
+    return normalizeMessageTextContent(content);
+  }
+  return parts.map((part) =>
+    part.type === "text"
+      ? { type: "text", text: part.text }
+      : {
+          type: "image_url",
+          image_url: {
+            url: part.dataUrl,
+          },
+        },
+  );
+}
+
+function toGeminiMessageParts(content: LlmMessageContent) {
+  const parts = normalizeMessageContentParts(content);
+  if (!parts.length) {
+    return [{ text: "" }];
+  }
+  return parts.map((part) => {
+    if (part.type === "text") {
+      return { text: part.text };
+    }
+    const image = getBase64PayloadFromDataUrl(part.dataUrl);
+    return {
+      inlineData: {
+        mimeType: part.mimeType || image.mimeType,
+        data: image.base64,
+      },
+    };
+  });
+}
+
+export function buildUserMessageContent(
+  text: string,
+  attachments?: ChatAttachment[] | null,
+): LlmMessageContent {
+  const normalizedText = String(text || "").trim();
+  const imageParts = (attachments || [])
+    .filter((attachment) => attachment?.kind === "image")
+    .map(
+      (attachment): LlmImagePart => ({
+        type: "image",
+        mimeType: String(attachment.mimeType || "").trim(),
+        dataUrl: String(attachment.dataUrl || "").trim(),
+      }),
+    )
+    .filter((part) => part.mimeType && part.dataUrl);
+
+  if (!imageParts.length) {
+    return normalizedText;
+  }
+
+  return [
+    ...(normalizedText ? [{ type: "text", text: normalizedText } satisfies LlmTextPart] : []),
+    ...imageParts,
+  ];
+}
+
 export function supportsNativeToolCalling(config?: LlmRuntimeConfig) {
   const runtime = resolveRuntimeConfig(config);
   return (
@@ -360,7 +495,10 @@ async function openAiCompatibleChat(
     body: JSON.stringify({
       model,
       temperature: mode === "builder" ? 0.6 : 0.8,
-      messages,
+      messages: messages.map((message) => ({
+        role: message.role,
+        content: toOpenAiMessageContent(message.content),
+      })),
     }),
   });
 
@@ -389,14 +527,17 @@ async function anthropicChat(
   const model = specificBuilderModel || runtime.model;
   const system = messages
     .filter((message) => message.role === "system")
-    .map((message) => message.content)
+    .map((message) => normalizeMessageTextContent(message.content))
     .join("\n\n")
     .trim();
   const conversation = messages
     .filter((message) => message.role !== "system")
     .map((message) => ({
       role: message.role === "assistant" ? "assistant" : "user",
-      content: message.content,
+      content:
+        message.role === "assistant"
+          ? normalizeMessageTextContent(message.content)
+          : toAnthropicContent(message.content),
     }));
 
   const response = await fetchWithRetry(`${runtime.baseUrl}/messages`, {
@@ -445,14 +586,17 @@ async function googleGeminiChat(
   const model = specificBuilderModel || runtime.model;
   const system = messages
     .filter((message) => message.role === "system")
-    .map((message) => message.content)
+    .map((message) => normalizeMessageTextContent(message.content))
     .join("\n\n")
     .trim();
   const contents = messages
     .filter((message) => message.role !== "system")
     .map((message) => ({
       role: message.role === "assistant" ? "model" : "user",
-      parts: [{ text: message.content }],
+      parts:
+        message.role === "assistant"
+          ? [{ text: normalizeMessageTextContent(message.content) }]
+          : toGeminiMessageParts(message.content),
     }));
 
   const response = await fetchWithRetry(
@@ -512,7 +656,10 @@ async function mainProjectGlmChat(
     },
     body: JSON.stringify({
       model: runtime.glmModel,
-      messages,
+      messages: messages.map((message) => ({
+        role: message.role,
+        content: toOpenAiMessageContent(message.content),
+      })),
       temperature: mode === "builder" ? 0.35 : 0.8,
       max_tokens: mode === "builder" ? 1400 : 1000,
       top_p: mode === "builder" ? 0.8 : 0.95,
@@ -586,7 +733,7 @@ function mapOpenAiConversationMessages(messages: LlmConversationMessage[]) {
 
     return {
       role: message.role,
-      content: message.content,
+      content: toOpenAiMessageContent(message.content),
     };
   });
 }
@@ -661,7 +808,7 @@ async function openAiCompatibleChatWithTools(
 function mapAnthropicConversation(messages: LlmConversationMessage[]) {
   const system = messages
     .filter((message) => message.role === "system")
-    .map((message) => message.content)
+    .map((message) => normalizeMessageTextContent(message.content))
     .join("\n\n")
     .trim();
 
@@ -703,7 +850,10 @@ function mapAnthropicConversation(messages: LlmConversationMessage[]) {
 
       return {
         role: message.role === "assistant" ? "assistant" : "user",
-        content: message.content,
+        content:
+          message.role === "assistant"
+            ? normalizeMessageTextContent(message.content)
+            : toAnthropicContent(message.content),
       };
     });
 
@@ -779,7 +929,7 @@ async function anthropicChatWithTools(
 function mapGeminiConversation(messages: LlmConversationMessage[]) {
   const system = messages
     .filter((message) => message.role === "system")
-    .map((message) => message.content)
+    .map((message) => normalizeMessageTextContent(message.content))
     .join("\n\n")
     .trim();
 
@@ -824,7 +974,10 @@ function mapGeminiConversation(messages: LlmConversationMessage[]) {
 
       return {
         role: message.role === "assistant" ? "model" : "user",
-        parts: [{ text: message.content }],
+        parts:
+          message.role === "assistant"
+            ? [{ text: normalizeMessageTextContent(message.content) }]
+            : toGeminiMessageParts(message.content),
       };
     });
 

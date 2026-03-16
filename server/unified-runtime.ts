@@ -1,5 +1,6 @@
 import type {
   CharacterRecord,
+  ChatAttachment,
   GenerationTrace,
   MarketListingRecord,
   NeuralMemoryRecord,
@@ -35,6 +36,7 @@ type UnifiedRuntimeInput = {
   character: CharacterRecord;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userMessage: string;
+  userAttachments?: ChatAttachment[];
   conversationId: string;
   config?: LlmRuntimeConfig;
   availableSkills: SkillCatalogItem[];
@@ -48,12 +50,18 @@ type UnifiedRuntimeInput = {
 export async function executeUnifiedRuntime(
   input: UnifiedRuntimeInput,
 ): Promise<UnifiedRuntimeResult> {
+  const decisionNotes = [
+    `Intent reason: ${input.decision.reason}`,
+    ...(input.decision.executionHints || []),
+  ];
+
   if (input.decision.path === "grouped_work" && input.decision.workIntent) {
     return executeGroupedWork({
       character: input.character,
       conversationId: input.conversationId,
       history: input.history,
       userMessage: input.userMessage,
+      userAttachments: input.userAttachments,
       config: input.config,
       availableSkills: input.availableSkills,
       attachedSkills: input.attachedSkills,
@@ -69,6 +77,7 @@ export async function executeUnifiedRuntime(
       character: input.character,
       history: input.history,
       userMessage: input.userMessage,
+      userAttachments: input.userAttachments,
       config: input.config,
       availableSkills: input.availableSkills,
       attachedSkills: input.attachedSkills,
@@ -76,7 +85,7 @@ export async function executeUnifiedRuntime(
       neuralState: input.neuralState,
       globalMemories: input.globalMemories,
       planningNotes: [
-        `Intent reason: ${input.decision.reason}`,
+        ...decisionNotes,
       ],
     });
     return {
@@ -95,6 +104,7 @@ export async function executeUnifiedRuntime(
     character: input.character,
     history: input.history,
     userMessage: input.userMessage,
+    userAttachments: input.userAttachments,
     config: input.config,
     availableSkills: input.availableSkills,
     attachedSkills: input.attachedSkills,
@@ -102,7 +112,7 @@ export async function executeUnifiedRuntime(
     neuralState: input.neuralState,
     globalMemories: input.globalMemories,
     planningNotes: [
-      `Intent reason: ${input.decision.reason}`,
+      ...decisionNotes,
     ],
   });
 

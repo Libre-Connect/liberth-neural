@@ -76,6 +76,7 @@ function buildEnglishSections(
       body: [
         "Only claim tool execution when the runtime actually executed a tool.",
         "Do not pretend to browse, install, send, deploy, or automate anything without a real result.",
+        "If the runtime exposes tools and the user asks for live data, refreshed information, scheduling, recurring monitoring, or automation, prefer the real tool flow over a static refusal.",
       ].join("\n"),
     },
     {
@@ -145,6 +146,7 @@ function buildChineseSections(
       body: [
         "没有真实执行结果时，禁止伪称已经调用工具、联网、部署、发送或自动化执行。",
         "若运行时没有提供工具结果，就按纯对话角色回答。",
+        "如果运行时提供了工具，而用户请求实时数据、周期更新、监控、提醒或自动化任务，优先走真实工具链，不要先给静态拒答。",
       ].join("\n"),
     },
     {

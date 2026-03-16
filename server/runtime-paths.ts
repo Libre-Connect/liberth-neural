@@ -1,4 +1,10 @@
-import type { CharacterRecord, NeuralMemoryRecord, NeuralStateSnapshot, SkillCatalogItem } from "../src/types";
+import type {
+  CharacterRecord,
+  ChatAttachment,
+  NeuralMemoryRecord,
+  NeuralStateSnapshot,
+  SkillCatalogItem,
+} from "../src/types";
 import type { LlmRuntimeConfig } from "./llm";
 import { buildRuntimeSystemPrompt } from "./workspace";
 import { runRoleAgentTurn } from "./agent-runtime";
@@ -17,6 +23,7 @@ type RuntimePathInput = {
   character: CharacterRecord;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userMessage: string;
+  userAttachments?: ChatAttachment[];
   config?: LlmRuntimeConfig;
   availableSkills: SkillCatalogItem[];
   attachedSkills: AttachedSkill[];
@@ -53,6 +60,7 @@ export async function executeDirectRuntimePath(input: RuntimePathInput): Promise
     systemPrompt,
     history: input.history,
     userMessage: input.userMessage,
+    userAttachments: input.userAttachments,
     config: input.config,
     allowMutatingTools: true,
   });

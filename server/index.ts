@@ -4,6 +4,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import type {
   CharacterRecord,
+  ChatAttachment,
   ConversationRecord,
   DeploymentChannel,
   DeploymentPlatformKey,
@@ -49,10 +50,11 @@ import {
   compactConversationIfNeeded,
 } from "./conversation-compaction";
 import { hasLlmAccess, type LlmRuntimeConfig } from "./llm";
-import { composeCharacterFromBrief } from "./roles";
+import { composeCharacterFromBrief, stabilizeRoleDefinition } from "./roles";
 import {
   attachSkillToCharacter,
   detachSkillFromCharacter,
+  ensureSkillInstalled,
   formatSkillListReply,
   listSkillCatalog,
   loadActiveSkill,
@@ -72,7 +74,11 @@ import { clientDistPath } from "./project-paths";
 const app = express();
 const port = Number(process.env.PORT || 4318);
 
-app.use(express.json({ limit: "2mb" }));
+const MAX_CHAT_ATTACHMENTS = 4;
+const MAX_CHAT_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_CHAT_TOTAL_BYTES = 10 * 1024 * 1024;
+
+app.use(express.json({ limit: "12mb" }));
 
 function ensureRoleDefinition(input: any): RoleDefinitionInput {
   return {
@@ -110,6 +116,360 @@ function ensureCharacterBriefInput(input: any) {
   return {
     brief: String(input?.brief || "").trim(),
     language: String(input?.language || "English").trim() || "English",
+  };
+}
+
+function estimateBase64PayloadBytes(base64: string) {
+  const normalized = String(base64 || "").replace(/\s+/g, "");
+  if (!normalized) return 0;
+  const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
+}
+
+function ensureChatAttachments(input: unknown): ChatAttachment[] {
+  if (!Array.isArray(input) || !input.length) {
+    return [];
+  }
+  if (input.length > MAX_CHAT_ATTACHMENTS) {
+    throw new Error(`A maximum of ${MAX_CHAT_ATTACHMENTS} images can be sent per message.`);
+  }
+
+  let totalBytes = 0;
+  return input.map((item, index) => {
+    const kind = String((item as any)?.kind || "image").trim().toLowerCase();
+    const mimeType = String((item as any)?.mimeType || "").trim().toLowerCase();
+    const dataUrl = String((item as any)?.dataUrl || "").trim();
+    const id = String((item as any)?.id || randomId("img")).trim() || randomId("img");
+    const name = String((item as any)?.name || "").trim();
+    const dataMatch = dataUrl.match(/^data:([^;,]+);base64,(.+)$/i);
+
+    if (kind !== "image") {
+      throw new Error(`Attachment ${index + 1} is not an image.`);
+    }
+    if (!mimeType.startsWith("image/")) {
+      throw new Error(`Attachment ${index + 1} must use an image MIME type.`);
+    }
+    if (!dataMatch) {
+      throw new Error(`Attachment ${index + 1} is not a valid base64 image.`);
+    }
+    if (String(dataMatch[1] || "").trim().toLowerCase() !== mimeType) {
+      throw new Error(`Attachment ${index + 1} MIME type does not match its data URL.`);
+    }
+
+    const sizeBytes = estimateBase64PayloadBytes(dataMatch[2]);
+    if (sizeBytes <= 0) {
+      throw new Error(`Attachment ${index + 1} is empty.`);
+    }
+    if (sizeBytes > MAX_CHAT_IMAGE_BYTES) {
+      throw new Error(`Attachment ${index + 1} exceeds the 4MB image limit.`);
+    }
+
+    totalBytes += sizeBytes;
+    if (totalBytes > MAX_CHAT_TOTAL_BYTES) {
+      throw new Error("Total image payload is too large for a single message.");
+    }
+
+    return {
+      id,
+      kind: "image" as const,
+      mimeType,
+      dataUrl,
+      ...(name ? { name } : {}),
+      sizeBytes,
+    };
+  });
+}
+
+function summarizeChatAttachments(attachments: ChatAttachment[]) {
+  if (!attachments.length) return "";
+  if (attachments.length === 1) {
+    return attachments[0].name
+      ? `Attached image: ${attachments[0].name}`
+      : "Attached image";
+  }
+  return `Attached ${attachments.length} images`;
+}
+
+function buildMessageContextText(input: {
+  content: string;
+  attachments?: ChatAttachment[];
+}) {
+  const parts = [String(input.content || "").trim()].filter(Boolean);
+  const attachmentSummary = summarizeChatAttachments(input.attachments || []);
+  if (attachmentSummary) {
+    parts.push(`[${attachmentSummary}]`);
+  }
+  return parts.join("\n");
+}
+
+function parseRecurringIntervalMinutes(message: string) {
+  const raw = String(message || "");
+  const normalized = raw.toLowerCase();
+
+  const englishMatch = normalized.match(
+    /every\s+(\d+)\s*(minute|minutes|min|hour|hours|day|days|week|weeks)/i,
+  );
+  if (englishMatch) {
+    const count = Math.max(1, Number(englishMatch[1] || 1));
+    const unit = englishMatch[2];
+    if (/minute|min/.test(unit)) return count;
+    if (/hour/.test(unit)) return count * 60;
+    if (/day/.test(unit)) return count * 60 * 24;
+    if (/week/.test(unit)) return count * 60 * 24 * 7;
+  }
+
+  const chineseMinute = raw.match(/每\s*(\d+)?\s*分(?:钟|鐘)/);
+  if (chineseMinute) {
+    return Math.max(1, Number(chineseMinute[1] || 1));
+  }
+  const chineseHour = raw.match(/每\s*(\d+)?\s*(?:小時|小时|钟头|鐘頭)/);
+  if (chineseHour) {
+    return Math.max(1, Number(chineseHour[1] || 1)) * 60;
+  }
+  const chineseDay = raw.match(/每\s*(\d+)?\s*天/);
+  if (chineseDay) {
+    return Math.max(1, Number(chineseDay[1] || 1)) * 60 * 24;
+  }
+  const chineseWeek = raw.match(/每\s*(\d+)?\s*(?:周|週)/);
+  if (chineseWeek) {
+    return Math.max(1, Number(chineseWeek[1] || 1)) * 60 * 24 * 7;
+  }
+
+  if (/(every minute|minutely)/i.test(normalized) || /每分钟|每分鐘/.test(raw)) {
+    return 1;
+  }
+  if (/(every hour|hourly)/i.test(normalized) || /每小时|每小時/.test(raw)) {
+    return 60;
+  }
+  if (/(every day|daily)/i.test(normalized) || /每天/.test(raw)) {
+    return 60 * 24;
+  }
+  if (/(every week|weekly)/i.test(normalized) || /每周|每週/.test(raw)) {
+    return 60 * 24 * 7;
+  }
+
+  return null;
+}
+
+function looksLikeModelLimitationReply(reply: string) {
+  const normalized = String(reply || "").toLowerCase();
+  if (!normalized) return false;
+  return /(抱歉|无法|不能|没法|暂时无法|我无法|sorry|unable|can'?t|cannot|do not have|not able)/i.test(
+    reply,
+  ) && /(实时|更新|价格|行情|price|quote|market|data|skill|automation|自动化|提醒|监控)/i.test(reply);
+}
+
+function buildAutomationSkillSearchQuery(message: string) {
+  const raw = String(message || "").trim();
+  const normalized = raw.toLowerCase();
+  if (/(eth|btc|bitcoin|crypto|加密货币|币价|幣價|以太坊|比特币|比特幣)/i.test(raw)) {
+    return "crypto price alerts market data automation";
+  }
+  if (/(stock|share price|股票|股价|股價)/i.test(raw)) {
+    return "stock price alerts market data automation";
+  }
+  if (/(weather|天气|天氣)/i.test(raw)) {
+    return "weather alerts forecast automation";
+  }
+  return normalized || raw;
+}
+
+function selectAutoInstallSkill(
+  message: string,
+  skills: Array<{
+    id: string;
+    name: string;
+    description: string;
+    packageRef?: string;
+    installs?: number;
+  }>,
+) {
+  if (!skills.length) return null;
+  const corpus = String(message || "").toLowerCase();
+  const preferred = skills.find((skill) => {
+    const haystack = `${skill.id} ${skill.name} ${skill.description}`.toLowerCase();
+    if (/(eth|btc|bitcoin|crypto|加密货币|币价|幣價|以太坊|比特币|比特幣)/i.test(corpus)) {
+      return /(crypto|market|price|stock|finance|trading|news)/.test(haystack);
+    }
+    if (/(weather|天气|天氣)/i.test(corpus)) {
+      return /(weather|forecast|alert)/.test(haystack);
+    }
+    return /(automation|workflow|alert|notify|monitor|market|finance|data)/.test(haystack);
+  });
+  return preferred || skills[0] || null;
+}
+
+function buildAutomationName(message: string) {
+  const raw = String(message || "").trim();
+  if (/(eth|以太坊)/i.test(raw)) return "ETH 价格监控";
+  if (/(btc|比特币|比特幣)/i.test(raw)) return "BTC 价格监控";
+  if (/(weather|天气|天氣)/i.test(raw)) return "天气提醒";
+  return raw.slice(0, 24) || "自动化任务";
+}
+
+function buildAutomationPrompt(message: string, intervalMinutes: number) {
+  const raw = String(message || "").trim();
+  const target =
+    /(eth|以太坊)/i.test(raw)
+      ? "ETH"
+      : /(btc|比特币|比特幣)/i.test(raw)
+        ? "BTC"
+        : "目标信息";
+
+  return [
+    "执行一个真实的信息更新任务，不要回复静态限制说明。",
+    `用户原始请求：${raw}`,
+    `执行频率：每 ${intervalMinutes} 分钟一次。`,
+    `优先获取 ${target} 的最新信息。`,
+    "如果已安装相关 skill，优先使用它；如果没有合适 skill，就使用可用工具或搜索能力完成。",
+    "默认用中文简洁输出。",
+    "输出格式：时间｜结果/价格｜来源｜一句变化说明。",
+    "如果本轮获取失败，只说明失败原因，不要编造数据。",
+  ].join("\n");
+}
+
+function formatNextRun(nextRunAt: number) {
+  if (!Number.isFinite(nextRunAt)) return "unknown";
+  return new Date(nextRunAt).toLocaleString("zh-CN");
+}
+
+async function recoverAutomationRequest(input: {
+  message: string;
+  decision: ReturnType<typeof deriveUnifiedRuntimeDecision>;
+  reply: string;
+  generation: GenerationTrace;
+  toolEvents: Array<{
+    step: number;
+    tool: string;
+    arguments: Record<string, unknown>;
+    ok: boolean;
+    summary: string;
+  }>;
+  providerConfig: LlmRuntimeConfig;
+  character: CharacterRecord;
+}) {
+  const intervalMinutes = parseRecurringIntervalMinutes(input.message);
+  if (!intervalMinutes) return null;
+  if ((input.toolEvents || []).length > 0) return null;
+  if (!input.decision.executionHints?.length && !looksLikeModelLimitationReply(input.reply)) {
+    return null;
+  }
+
+  const recoveryEvents: Array<{
+    step: number;
+    tool: string;
+    arguments: Record<string, unknown>;
+    ok: boolean;
+    summary: string;
+  }> = [];
+
+  const searchQuery = buildAutomationSkillSearchQuery(input.message);
+  let discoveredSkills: Awaited<ReturnType<typeof listSkillCatalog>> = [];
+  try {
+    discoveredSkills = (await listSkillCatalog(searchQuery, input.providerConfig)).slice(0, 5);
+    recoveryEvents.push({
+      step: recoveryEvents.length + 1,
+      tool: "search_skills",
+      arguments: { query: searchQuery },
+      ok: true,
+      summary: discoveredSkills.length
+        ? `Discovered ${discoveredSkills.length} candidate skills.`
+        : "No installable skill matched the request.",
+    });
+  } catch (error: any) {
+    recoveryEvents.push({
+      step: recoveryEvents.length + 1,
+      tool: "search_skills",
+      arguments: { query: searchQuery },
+      ok: false,
+      summary: String(error?.message || error || "search_failed"),
+    });
+  }
+
+  let workingCharacter = input.character;
+  const selectedSkill = selectAutoInstallSkill(input.message, discoveredSkills);
+  let installedSkillName = "";
+  if (selectedSkill) {
+    try {
+      await updateStore(async (store) => {
+        const record = await ensureSkillInstalled(
+          store,
+          selectedSkill.id,
+          input.character.id,
+          selectedSkill.packageRef,
+        );
+        const target = store.characters.find((item) => item.id === input.character.id);
+        if (!target) {
+          throw new Error("Character not found");
+        }
+        target.skillIds = Array.isArray(target.skillIds) ? target.skillIds : [];
+        if (!target.skillIds.includes(record.skillId)) {
+          target.skillIds.push(record.skillId);
+        }
+        target.updatedAt = Date.now();
+        workingCharacter = target;
+      });
+      installedSkillName = selectedSkill.name || selectedSkill.id;
+      recoveryEvents.push({
+        step: recoveryEvents.length + 1,
+        tool: "install_skill",
+        arguments: {
+          skillId: selectedSkill.id,
+          ...(selectedSkill.packageRef ? { packageRef: selectedSkill.packageRef } : {}),
+        },
+        ok: true,
+        summary: `Attached skill ${selectedSkill.id} to the character workspace.`,
+      });
+    } catch (error: any) {
+      recoveryEvents.push({
+        step: recoveryEvents.length + 1,
+        tool: "install_skill",
+        arguments: {
+          skillId: selectedSkill.id,
+          ...(selectedSkill.packageRef ? { packageRef: selectedSkill.packageRef } : {}),
+        },
+        ok: false,
+        summary: String(error?.message || error || "install_failed"),
+      });
+    }
+  }
+
+  const automation = await createOrUpdateAutomation({
+    characterId: input.character.id,
+    name: buildAutomationName(input.message),
+    prompt: buildAutomationPrompt(input.message, intervalMinutes),
+    intervalMinutes,
+    enabled: true,
+  });
+  recoveryEvents.push({
+    step: recoveryEvents.length + 1,
+    tool: "create_automation",
+    arguments: {
+      name: automation.name,
+      intervalMinutes: automation.intervalMinutes,
+    },
+    ok: true,
+    summary: `Created automation ${automation.id}; next run at ${formatNextRun(automation.nextRunAt || 0)}.`,
+  });
+
+  const replyLines = [
+    `已为你创建自动化任务：${automation.name}`,
+    `执行频率：每 ${automation.intervalMinutes} 分钟`,
+    `下次执行：${formatNextRun(automation.nextRunAt || 0)}`,
+    installedSkillName
+      ? `已附加 skill：${installedSkillName}`
+      : "这次没有找到合适 skill，先用内置能力创建了自动化。",
+  ];
+
+  return {
+    assistantReply: replyLines.join("\n"),
+    generation: {
+      ...input.generation,
+      reason: "automation_recovery",
+      nativeTools: true,
+    },
+    toolEvents: recoveryEvents,
+    workingCharacter,
   };
 }
 
@@ -318,7 +678,7 @@ function toThreadMemories(conversation: ConversationRecord): NeuralMemoryRecord[
     ...conversation.messages.slice(-10).map((message, index) => ({
       id: `thread_${index + 1}`,
       scope: "thread" as const,
-      content: `${message.role}: ${message.content}`,
+      content: `${message.role}: ${buildMessageContextText(message)}`,
       createdAt: message.createdAt,
       sourceRoute: undefined,
     })),
@@ -432,7 +792,7 @@ function buildConversationExportMarkdown(input: {
   for (const message of conversation.messages) {
     lines.push(`## ${message.role.toUpperCase()} · ${toIso(message.createdAt)}`);
     lines.push("");
-    lines.push(message.content);
+    lines.push(buildMessageContextText(message));
     lines.push("");
 
     if (message.role === "assistant" && message.generation) {
@@ -993,7 +1353,7 @@ app.put("/api/settings/provider", async (req, res) => {
 
 app.post("/api/characters/generate", async (req, res) => {
   try {
-    const definition = ensureRoleDefinition(req.body?.definition);
+    const definition = stabilizeRoleDefinition(ensureRoleDefinition(req.body?.definition));
     validateDefinition(definition);
     const blueprint = await buildGovernedBlueprint(definition);
     res.json({ blueprint });
@@ -1021,7 +1381,7 @@ app.post("/api/characters/compose", async (req, res) => {
 
 app.post("/api/characters", async (req, res) => {
   try {
-    const definition = ensureRoleDefinition(req.body?.definition);
+    const definition = stabilizeRoleDefinition(ensureRoleDefinition(req.body?.definition));
     validateDefinition(definition);
     const blueprint = req.body?.blueprint || (await buildGovernedBlueprint(definition));
     const character: CharacterRecord = {
@@ -1049,7 +1409,7 @@ app.put("/api/characters", async (req, res) => {
     const id = String(req.body?.id || "").trim();
     if (!id) throw new Error("Character id is required");
 
-    const definition = ensureRoleDefinition(req.body?.definition);
+    const definition = stabilizeRoleDefinition(ensureRoleDefinition(req.body?.definition));
     validateDefinition(definition);
 
     const store = await readStore();
@@ -1280,9 +1640,17 @@ app.post("/api/chat", async (req, res) => {
   try {
     const characterId = String(req.body?.characterId || "").trim();
     const message = String(req.body?.message || "").trim();
+    const attachments = ensureChatAttachments(req.body?.attachments);
     const conversationId = String(req.body?.conversationId || "").trim();
     if (!characterId) throw new Error("characterId is required");
-    if (!message) throw new Error("message is required");
+    if (!message && !attachments.length) {
+      throw new Error("message or image attachment is required");
+    }
+
+    const messageContextText = buildMessageContextText({
+      content: message,
+      attachments,
+    });
 
     const character = await getCharacterById(characterId);
     if (!character) {
@@ -1309,7 +1677,7 @@ app.post("/api/chat", async (req, res) => {
     const neuralState = deriveNeuralStateSnapshot({
       actorType: "clone",
       personaKind: "clone_user",
-      message,
+      message: messageContextText,
       profile: character.blueprint.profile || null,
       graph: character.blueprint.neuralGraph || null,
       threadMemories,
@@ -1321,6 +1689,7 @@ app.post("/api/chat", async (req, res) => {
       id: randomId("msg"),
       role: "user" as const,
       content: message,
+      ...(attachments.length ? { attachments } : {}),
       createdAt: Date.now(),
     };
 
@@ -1419,7 +1788,7 @@ app.post("/api/chat", async (req, res) => {
         ].join("\n");
         generation.reason = "missing_skill";
       } else {
-        const runtimeMessage = command.type === "use-skill" ? command.task : message;
+        const runtimeMessage = command.type === "use-skill" ? command.task : messageContextText;
         const decision = deriveUnifiedRuntimeDecision({
           message: runtimeMessage,
           commandType: command.type,
@@ -1429,6 +1798,7 @@ app.post("/api/chat", async (req, res) => {
           character: workingCharacter,
           history,
           userMessage: runtimeMessage,
+          userAttachments: command.type === "use-skill" ? undefined : attachments,
           conversationId: conversation.id,
           config: providerConfig,
           availableSkills,
@@ -1445,6 +1815,22 @@ app.post("/api/chat", async (req, res) => {
         workRun = runtimeResult.workRun || null;
         marketListing = runtimeResult.marketListing || null;
         workingCharacter = (await getCharacterById(character.id)) || workingCharacter;
+
+        const recoveredAutomation = await recoverAutomationRequest({
+          message: runtimeMessage,
+          decision,
+          reply: assistantReply,
+          generation,
+          toolEvents,
+          providerConfig,
+          character: workingCharacter,
+        });
+        if (recoveredAutomation) {
+          assistantReply = recoveredAutomation.assistantReply;
+          generation = recoveredAutomation.generation;
+          toolEvents = recoveredAutomation.toolEvents;
+          workingCharacter = recoveredAutomation.workingCharacter;
+        }
       }
     }
 
@@ -1456,7 +1842,7 @@ app.post("/api/chat", async (req, res) => {
         : {}),
     };
 
-    const durableMemory = deriveDurableMemoryCandidate(message, neuralState);
+    const durableMemory = deriveDurableMemoryCandidate(messageContextText, neuralState);
     const assistantEntry = {
       id: randomId("msg"),
       role: "assistant" as const,
@@ -1474,7 +1860,7 @@ app.post("/api/chat", async (req, res) => {
     const nextConversation: ConversationRecord = {
       ...conversation,
       title: conversation.messages.length <= 1
-        ? message.slice(0, 48) || conversation.title
+        ? message.slice(0, 48) || summarizeChatAttachments(attachments) || conversation.title
         : conversation.title,
       updatedAt: Date.now(),
       messages: [...conversation.messages, userEntry, assistantEntry],

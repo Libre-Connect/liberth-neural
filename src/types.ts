@@ -379,6 +379,7 @@ export type RuntimeIntentDecision = {
   confidence: number;
   publicationCandidate: boolean;
   workIntent?: WorkIntent | null;
+  executionHints?: string[] | null;
 };
 
 export type WorkIntent = {
@@ -478,10 +479,20 @@ export type ToolEventRecord = {
   summary: string;
 };
 
+export type ChatAttachment = {
+  id: string;
+  kind: "image";
+  mimeType: string;
+  dataUrl: string;
+  name?: string;
+  sizeBytes?: number;
+};
+
 export type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  attachments?: ChatAttachment[];
   createdAt: number;
   generation?: GenerationTrace | null;
   neuralRecord?: NeuralRecord | null;

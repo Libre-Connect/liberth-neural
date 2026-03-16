@@ -1,5 +1,6 @@
 import type {
   CharacterRecord,
+  ChatAttachment,
   GenerationTrace,
   MarketListingRecord,
   NeuralMemoryRecord,
@@ -158,6 +159,7 @@ export async function executeGroupedWork(input: {
   conversationId: string;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   userMessage: string;
+  userAttachments?: ChatAttachment[];
   config?: LlmRuntimeConfig;
   availableSkills: SkillCatalogItem[];
   attachedSkills: AttachedSkill[];
